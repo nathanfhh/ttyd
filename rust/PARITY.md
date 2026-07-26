@@ -27,22 +27,22 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 84 run against it, all passing | **87.89 %** |
-| Rust port (`rust/src/*.rs`, 2454 lines) | 177 total, all passing | **91.32 %** |
+| C reference (`src/*.c`, 966 lines) | 90 run against it, all passing | **88.82 %** |
+| Rust port (`rust/src/*.rs`, 2517 lines) | 188 total, all passing | **92.61 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 75 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 80 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
 | `ws_parity` | 31 | yes |
 | `tls_parity` | 3 | yes |
-| `lifecycle_parity` | 20 | yes |
+| `lifecycle_parity` | 26 | yes |
 | `forward_auth` | 18 | no — new feature |
 
-77 of the 84 shared tests assert identical behaviour on both binaries. The remaining six
+83 of the 90 shared tests assert identical behaviour on both binaries. The remaining seven
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
@@ -217,6 +217,14 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **The UNIX domain socket was created world-connectable.** libwebsockets `chmod`s the socket
+  to `0660` right after binding; this port left it at the process umask, i.e. `0755`, so on a
+  host where `--interface /run/ttyd.sock` is used precisely to restrict access, every local
+  user could open a terminal instead. The same code path also skipped the `chown` to `-u`/`-g`
+  that the C build performs. Both were found by auditing `serve.rs` line by line against
+  `server.c` and `strace`-ing the two binaries side by side, not by any test — the existing
+  socket test asserted `uid == 0` while running as root, which is true whether or not anything
+  happened. It now asserts the mode and chowns to a user that is not the test's own.
 - **The forwarded identity was silently truncated to 29 bytes**, mirroring the C buffer. That
   is worse than it looks: two accounts sharing a 29-byte prefix would collapse onto the same
   `TTYD_USER`. The limit is gone — the name is passed through whole. (The C build refuses the
@@ -237,3 +245,68 @@ authentication modes, TLS with client-certificate verification, UNIX domain sock
 privilege dropping and the `--once` / `--exit-no-conn` lifecycle rules. Each option has at
 least one test asserting an observable effect, so "implemented" here means exercised rather
 than merely parsed.
+
+One option carries a caveat, stated because the sentence above would otherwise overstate
+what was checked. `-6` has a unit test pinning the address it selects, and an integration
+test that serves a real request over `[::1]` — but the container this was validated in has
+no IPv6 stack (`bind` returns `Address family not supported by protocol`), so that
+integration test skipped rather than ran here. The option is proved end to end only on a
+host with IPv6 enabled.
+
+## Browser verification
+
+The rest of the suite talks to the protocol with a synthetic client, which proves the wire
+format but not that the shipped frontend works against it. `browser-check.py` drives a real
+Chromium through the real xterm.js bundle with Playwright and checks, on both builds:
+
+- the frontend loads and xterm.js mounts
+- typed keystrokes reach the shell (verified by files the shell creates — xterm.js renders
+  to a WebGL canvas, so terminal text is not readable from the DOM)
+- `TERM` reaches the child, and a viewport resize reaches its `winsize`
+- colour, CJK and box-drawing render (screenshot)
+- a full-screen program (`vi`) round-trips through the alternate screen
+- no uncaught frontend errors, and the session never drops
+- with `TTYD_BROWSER_TLS=1`: the same run over HTTPS against a generated CA, asserting
+  `location.protocol === "https:"`
+
+Two things came out of this that the protocol-level suite could not have found: `--title`
+had to be checked against a real browser tab, and `networkidle` never fires because the
+WebSocket keeps the page busy.
+
+It also produced a false accusation worth recording. `vi` failed three times running
+against the C build and passed against Rust, which looked like a C defect. Comparing the
+raw protocol output showed both builds emitting byte-identical 3370-byte responses
+containing `?1049h` — the real cause was a `.swp` file the *previous* run had left behind,
+which made vim prompt instead of opening. The harness had cross-run state; the fix was a
+fresh directory per run.
+
+## Soak
+
+A ten-minute run with eight concurrent clients connecting, streaming and disconnecting in
+a loop, sampling the server every 30 seconds:
+
+| | start (t=60s) | end (t=600s) |
+|---|---|---|
+| RSS | 10 180 kB | 10 692 kB |
+| open descriptors | 42 | 42 |
+| threads | 29 | 29 |
+
+792 sessions, 11.2 GB of terminal output, no errors. The RSS figure oscillated between
+9.9 MB and 11.1 MB throughout with no trend; descriptors and threads did not move at all.
+
+The first attempt at this measurement reported the server freezing after three minutes.
+That was the harness: it read the server's stderr only until the port line appeared, so
+the log filled the 64 kB pipe buffer and the server blocked in `write()`. Recorded because
+the failure looked exactly like a server defect until the stack was inspected — the same
+class of mistake as the vi false alarm above.
+
+## Dependencies
+
+`cargo audit` against the RustSec database (1169 advisories) reports **no vulnerabilities**
+across the 224 crates in `Cargo.lock`. One informational warning: `rustls-pemfile` 2.2.0 is
+marked unmaintained (RUSTSEC-2025-0134). It is used only to parse the PEM files named by
+`--ssl-cert`, `--ssl-key` and `--ssl-ca` — operator-supplied local files, not network input.
+
+Trivy was not run: this environment's proxy scopes GitHub access to the session's own
+repositories, so the installer, the release API and the apt repository are all unreachable.
+That is a gap in this report, not a clean result.

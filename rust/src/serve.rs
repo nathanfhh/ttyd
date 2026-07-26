@@ -47,9 +47,7 @@ pub async fn bind(cfg: &Config) -> Result<Listener> {
         }
         let listener = UnixListener::bind(&path)
             .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
-        if let Some(owner) = &cfg.socket_owner {
-            apply_socket_owner(&path, owner)?;
-        }
+        apply_socket_permissions(&path, cfg)?;
         return Ok(Listener::Unix { listener, path });
     }
 
@@ -92,6 +90,32 @@ fn resolve_bind_address(cfg: &Config) -> Result<IpAddr> {
         }
     }
     bail!("no address found for interface {iface}")
+}
+
+/// Reproduces what libwebsockets does to a UNIX domain socket right after binding it:
+/// `chown` to the context's uid/gid — i.e. whatever `-u`/`-g` asked for — then to the
+/// `--socket-owner` pair if one was given, then an unconditional `chmod 0660`.
+///
+/// The mode is the part that matters, and it is the part this port originally missed.
+/// Without it the socket keeps the process umask, which on a default umask means `0755`:
+/// world-connectable, so any local user on the box gets a terminal. Verified against the C
+/// build by `strace`, which shows `chown` followed by `chmod(path, 0660)` on every start.
+fn apply_socket_permissions(path: &std::path::Path, cfg: &Config) -> Result<()> {
+    let uid = cfg.uid.map(nix::unistd::Uid::from_raw);
+    let gid = cfg.gid.map(nix::unistd::Gid::from_raw);
+    if uid.is_some() || gid.is_some() {
+        nix::unistd::chown(path, uid, gid)
+            .with_context(|| format!("cannot chown {}", path.display()))?;
+    }
+
+    if let Some(owner) = &cfg.socket_owner {
+        apply_socket_owner(path, owner)?;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("cannot chmod {}", path.display()))?;
+    Ok(())
 }
 
 fn apply_socket_owner(path: &std::path::Path, owner: &str) -> Result<()> {
@@ -342,4 +366,56 @@ pub fn drop_privileges(cfg: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(mutate: impl FnOnce(&mut Config)) -> Config {
+        let mut c = Config {
+            argv: vec!["bash".into()],
+            command: "bash".into(),
+            ..Default::default()
+        };
+        mutate(&mut c);
+        c
+    }
+
+    #[test]
+    fn no_interface_binds_all_ipv4_addresses() {
+        let address = resolve_bind_address(&cfg(|_| {})).expect("resolves");
+        assert_eq!(address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn the_ipv6_flag_binds_the_unspecified_v6_address() {
+        // Matches the C build, which clears LWS_SERVER_OPTION_DISABLE_IPV6 for `-6`.
+        let address = resolve_bind_address(&cfg(|c| c.ipv6 = true)).expect("resolves");
+        assert_eq!(address, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn a_literal_address_is_used_as_given() {
+        let address =
+            resolve_bind_address(&cfg(|c| c.iface = Some("127.0.0.1".into()))).expect("resolves");
+        assert_eq!(address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn an_interface_name_resolves_to_its_address() {
+        // `-i eth0` in the C help means a device name, not an address.
+        let address =
+            resolve_bind_address(&cfg(|c| c.iface = Some("lo".into()))).expect("resolves");
+        assert_eq!(address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn an_unknown_interface_is_an_error_rather_than_a_silent_wildcard() {
+        let result = resolve_bind_address(&cfg(|c| c.iface = Some("nosuchdev0".into())));
+        assert!(
+            result.is_err(),
+            "an unknown interface must not bind everything"
+        );
+    }
 }

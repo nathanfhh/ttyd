@@ -48,6 +48,54 @@ async fn the_debug_level_option_is_accepted() {
 }
 
 #[tokio::test]
+async fn a_low_debug_level_silences_the_log_without_silencing_the_server() {
+    // `-d` is the libwebsockets level bitmask: 1 is errors only, so the startup notices go
+    // away while the server keeps serving. Verified to match the C build, which is equally
+    // silent at `-d 1`. Without this the option is only proved to parse.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("addr").port()
+    };
+    let mut child = std::process::Command::new(common::binary())
+        .args(["-p", &port.to_string(), "-d", "1", "bash"])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let client = common::http_client();
+    let url = format!("http://127.0.0.1:{port}/token");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut served = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(r) = client.get(&url).send().await {
+            served = r.status() == 200;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "the server must still serve at -d 1");
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+
+    use std::io::Read;
+    let mut log = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut log)
+        .expect("read log");
+    assert!(
+        log.is_empty(),
+        "-d 1 must suppress the startup notices, got: {log}"
+    );
+}
+
+#[tokio::test]
 async fn binding_to_an_explicit_address_works() {
     let server = Server::start(&["-i", "127.0.0.1", "bash"]);
     let response = common::http_client()
@@ -55,6 +103,34 @@ async fn binding_to_an_explicit_address_works() {
         .send()
         .await
         .expect("request");
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn binding_to_an_interface_by_name_works() {
+    // `-i` accepts a device name as well as an address — the C help documents `eth0`.
+    let server = Server::start(&["-i", "lo", "bash"]);
+    let response = common::http_client()
+        .get(server.http_url("/token"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn ipv6_binding_serves_over_ipv6() {
+    // Skipped where the kernel has no IPv6 at all; the address selection itself is covered
+    // by a unit test that needs no network stack.
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return;
+    }
+    let server = Server::start(&["-6", "bash"]);
+    let response = common::http_client()
+        .get(format!("http://[::1]:{}/token", server.port))
+        .send()
+        .await
+        .expect("request over IPv6");
     assert_eq!(response.status(), 200);
 }
 
@@ -69,6 +145,64 @@ async fn the_browser_option_does_not_prevent_serving() {
         .await
         .expect("request");
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn the_browser_option_launches_the_system_opener_with_the_url() {
+    // `-B` is otherwise untestable: with no X server both builds decline to launch anything,
+    // so "it did not crash" is all you get. Stubbing `xset` and `xdg-open` onto PATH makes
+    // the launch observable — the stub records the URL it was handed.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("opened-url");
+
+    std::fs::write(dir.path().join("xset"), "#!/bin/sh\nexit 0\n").expect("write xset");
+    std::fs::write(
+        dir.path().join("xdg-open"),
+        format!("#!/bin/sh\nprintf '%s' \"$1\" > {}\n", marker.display()),
+    )
+    .expect("write xdg-open");
+    for stub in ["xset", "xdg-open"] {
+        std::fs::set_permissions(
+            dir.path().join(stub),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod stub");
+    }
+
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("addr").port()
+    };
+    let mut child = std::process::Command::new(common::binary())
+        .args(["-p", &port.to_string(), "-B", "bash"])
+        .env("PATH", path)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let opened = std::fs::read_to_string(&marker).unwrap_or_default();
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+
+    assert_eq!(
+        opened,
+        format!("http://localhost:{port}"),
+        "-B must hand the system opener the served URL, as the C build does"
+    );
 }
 
 #[tokio::test]
@@ -454,17 +588,16 @@ async fn the_server_pings_idle_sessions() {
     );
 }
 
-#[tokio::test]
-async fn the_socket_owner_option_is_applied() {
-    // chown to another owner requires root; without it the option cannot be exercised at all.
-    if unsafe { libc::geteuid() } != 0 {
-        return;
-    }
+/// Starts a server on a UNIX socket, waits for the file, and returns its uid, gid and mode.
+async fn socket_metadata(extra: &[&str]) -> (u32, u32, u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("owned.sock");
+    let mut args = vec!["-i", socket.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    args.push("bash");
 
     let mut child = std::process::Command::new(common::binary())
-        .args(["-i", socket.to_str().unwrap(), "-U", "root:root", "bash"])
+        .args(&args)
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
@@ -475,15 +608,55 @@ async fn the_socket_owner_option_is_applied() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(socket.exists(), "the unix socket was never created");
+    // The chown/chmod happen right after bind, but the file appears at bind — give the
+    // permission calls a moment rather than racing them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(&socket).expect("stat socket");
-    assert_eq!(meta.uid(), 0, "socket owner was not applied");
+    let result = (meta.uid(), meta.gid(), meta.mode() & 0o777);
 
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
     let _ = child.wait();
+    result
+}
+
+#[tokio::test]
+async fn a_unix_socket_is_not_world_connectable() {
+    // libwebsockets chmods the socket to 0660 unconditionally after binding. Inheriting the
+    // umask instead would leave it 0755 on a default umask, handing a terminal to every
+    // local user — so this is the security-relevant half of the unix socket path.
+    let (_, _, mode) = socket_metadata(&[]).await;
+    assert_eq!(
+        mode, 0o660,
+        "unix socket mode must match the C build's 0660"
+    );
+}
+
+#[tokio::test]
+async fn the_gid_option_owns_the_unix_socket() {
+    // The C build chowns the socket to the context uid/gid, which is what -u/-g set.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let (_, gid, mode) = socket_metadata(&["-g", "1"]).await;
+    assert_eq!(gid, 1, "-g must own the socket, as it does in the C build");
+    assert_eq!(mode, 0o660);
+}
+
+#[tokio::test]
+async fn the_socket_owner_option_is_applied() {
+    // chown to another owner requires root; without it the option cannot be exercised at all.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    // `daemon` is uid/gid 1 on every distribution this runs on, and is not the test's own
+    // identity — asserting against root would pass whether or not the chown happened.
+    let (uid, gid, mode) = socket_metadata(&["-U", "daemon:daemon"]).await;
+    assert_eq!((uid, gid), (1, 1), "socket owner was not applied");
+    assert_eq!(mode, 0o660);
 }
 
 #[tokio::test]

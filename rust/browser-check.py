@@ -5,6 +5,7 @@ format but not that the shipped frontend works against it. xterm.js renders glyp
 WebGL canvas, so terminal contents are not readable from the DOM — keystrokes are therefore
 verified by their *effect* (files the shell creates), and rendering from a screenshot.
 """
+import os
 import pathlib
 import re
 import subprocess
@@ -26,7 +27,30 @@ else:
     WORK.mkdir()
 
 IS_C = LABEL == "c"
-args = [BIN, "-p", "0", "-W"] + ([] if IS_C else ["--title", "Browser Check"]) + ["bash"]
+USE_TLS = os.environ.get("TTYD_BROWSER_TLS") == "1"
+
+tls_args = []
+if USE_TLS:
+    # A throwaway CA and a leaf it signed; the browser is told to trust the CA.
+    ext = WORK / "san.ext"
+    ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
+
+    def openssl(*a):
+        subprocess.run(["openssl", *a], check=True, capture_output=True)
+
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=ttyd-browser-ca",
+            "-keyout", str(WORK / "ca.key"), "-out", str(WORK / "ca.crt"))
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+            "-keyout", str(WORK / "server.key"), "-out", str(WORK / "server.csr"))
+    openssl("x509", "-req", "-in", str(WORK / "server.csr"),
+            "-CA", str(WORK / "ca.crt"), "-CAkey", str(WORK / "ca.key"),
+            "-CAcreateserial", "-days", "1", "-extfile", str(ext),
+            "-out", str(WORK / "server.crt"))
+    tls_args = ["-S", "-C", str(WORK / "server.crt"), "-K", str(WORK / "server.key")]
+
+args = ([BIN, "-p", "0", "-W"] + tls_args
+        + ([] if IS_C else ["--title", "Browser Check"]) + ["bash"])
 proc = subprocess.Popen(
     args,
     stdout=subprocess.DEVNULL,
@@ -70,15 +94,26 @@ with sync_playwright() as pw:
         args=["--no-sandbox"],
         executable_path="/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     )
-    page = browser.new_page(viewport={"width": 1100, "height": 700})
+    page = browser.new_page(
+        viewport={"width": 1100, "height": 700},
+        # The certificate is generated per run by a throwaway CA the browser has no reason
+        # to know; the point of the TLS pass is the handshake and the wss:// upgrade.
+        ignore_https_errors=USE_TLS,
+    )
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
     disconnects = []
     page.on("websocket", lambda ws: ws.on("close", lambda _: disconnects.append(1)))
 
-    page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+    scheme = "https" if USE_TLS else "http"
+    page.goto(f"{scheme}://127.0.0.1:{port}/", wait_until="domcontentloaded")
     page.wait_for_selector(".xterm-screen", timeout=15000)
-    check("frontend loads and xterm.js mounts", True)
+    check(f"frontend loads and xterm.js mounts over {scheme}", True)
+
+    if USE_TLS:
+        # The frontend must have followed the page scheme to wss://, not fallen back to ws://.
+        ws_url = page.evaluate("() => window.location.protocol")
+        check("the page is actually served over TLS", ws_url == "https:", f"protocol={ws_url}")
 
     title = page.title()
     if IS_C:
@@ -145,5 +180,7 @@ proc.terminate()
 proc.wait(timeout=5)
 
 print(f"  screenshots: /tmp/ttyd-{LABEL}.png, /tmp/ttyd-{LABEL}-vi.png")
+if USE_TLS:
+    print("  (TLS pass)")
 print(f"\n  {LABEL}: {'ALL PASSED' if not failures else 'FAILED: ' + ', '.join(failures)}")
 sys.exit(1 if failures else 0)
