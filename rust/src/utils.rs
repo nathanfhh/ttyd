@@ -42,12 +42,17 @@ pub fn get_sig(name: &str) -> i32 {
             return sig as i32;
         }
     }
-    // Mirrors the C fallback to atoi(), which yields 0 for non-numeric input.
-    let digits: String = name
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
-        .collect();
+    // Mirrors the C fallback to atoi(): an optional *leading* sign, then digits, stopping at
+    // the first character that is neither. Accepting a sign anywhere in the run instead made
+    // `9-1` collect as `9-1`, fail to parse and yield 0, where atoi answers 9 — so `-s 9-1`
+    // was rejected here and accepted by the C build.
+    let text = name.trim_start();
+    let mut digits = String::with_capacity(text.len());
+    let mut rest = text.chars().peekable();
+    if matches!(rest.peek(), Some('+' | '-')) {
+        digits.push(rest.next().expect("peeked"));
+    }
+    digits.extend(rest.take_while(|c| c.is_ascii_digit()));
     digits.parse().unwrap_or(0)
 }
 
@@ -97,6 +102,25 @@ pub fn open_uri(uri: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_numeric_signal_is_parsed_the_way_atoi_would() {
+        // Compared against the C build one input at a time; each of these is a value it
+        // accepts, so rejecting them here would narrow what `--signal` takes.
+        assert_eq!(get_sig("9"), 9);
+        assert_eq!(get_sig("+9"), 9);
+        assert_eq!(get_sig("-9"), -9);
+        // atoi stops at the first character that is not part of the number.
+        assert_eq!(get_sig("9-1"), 9);
+        assert_eq!(get_sig("9+1"), 9);
+        assert_eq!(get_sig("12abc"), 12);
+        assert_eq!(get_sig("  15"), 15);
+        // And yields zero when there is no number at all.
+        assert_eq!(get_sig("nonsense"), 0);
+        assert_eq!(get_sig("+"), 0);
+        assert_eq!(get_sig("-"), 0);
+        assert_eq!(get_sig(""), 0);
+    }
 
     #[test]
     fn signal_names_round_trip() {

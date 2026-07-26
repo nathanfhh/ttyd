@@ -679,10 +679,9 @@ async fn a_socket_left_by_an_unclean_shutdown_is_replaced() {
 #[tokio::test]
 async fn a_socket_owner_without_a_group_sets_only_the_user() {
     // `-U user` without a group. The C build does not merely ignore the group half — it
-    // abandons the whole permission step, leaving the socket at the process umask (0755,
-    // world-connectable) with no chown either. A missing `:group` therefore silently removes
-    // the protection that using a UNIX socket was meant to provide. Recorded in PARITY.md;
-    // skipped against C, which cannot pass by construction.
+    // abandons the whole permission step, so the socket keeps the process umask and is never
+    // chowned. Neither the group access `--socket-owner` was asked for nor the 0660 guarantee
+    // survives. Recorded in PARITY.md; skipped against C, which cannot pass by construction.
     if common::is_c_reference() {
         return;
     }

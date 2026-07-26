@@ -135,7 +135,7 @@ output travels through a bounded channel, so a paused or slow client stalls the 
 thread and the kernel PTY buffer applies backpressure to the child process. The test is
 skipped against the C reference, with the reason recorded at the assertion.
 
-### 4. `--socket-owner` without a group silently unprotects the socket
+### 4. `--socket-owner` without a group is silently ignored
 
 **Found by:** `lifecycle_parity::a_socket_owner_without_a_group_sets_only_the_user`, while
 adding coverage for the short form of the option.
@@ -145,10 +145,11 @@ with the group half left off, produces `srwxr-xr-x 0 0` — libwebsockets fails 
 string and then abandons the whole permission step, so neither the `chown` nor the
 unconditional `chmod 0660` happens. The socket is left at the process umask.
 
-That is the dangerous direction for a typo to fail in. An operator who writes `-U ttyd`
-instead of `-U ttyd:ttyd` gets a server that starts normally, logs nothing unusual, and
-leaves a world-connectable terminal socket — the opposite of what reaching for a UNIX socket
-was meant to achieve.
+An operator who writes `-U ttyd` instead of `-U ttyd:ttyd` therefore gets a server that
+starts normally, logs nothing unusual, and hands out none of the access that was asked for:
+the named user does not own the socket, and the group cannot reach it. How exposed the
+result is depends on the umask — see the note below — but in every case the option silently
+did nothing.
 
 **Resolution: the port applies the user half and still enforces the mode.** A missing group
 means "do not change the group", not "do nothing". The test is skipped against the C
@@ -294,10 +295,9 @@ approach above was blind.
   `accept` fails again at once — the loop busy-spins a core and starves the runtime that
   would otherwise be closing the connections which free those descriptors. Failures are now
   logged and backed off.
-- **The UNIX socket was world-connectable for a moment even after the `chmod`.** Tightening
-  the mode after `bind` leaves a window in which it carries the process umask. Binding now
-  happens under a umask that already denies everyone else, and the `chmod` confirms the
-  result rather than being the only thing standing between the socket and the rest of the box.
+- **The UNIX socket carried the process umask between `bind` and the `chmod`.** Binding now
+  happens under a umask that already denies everyone else, so the mode never depends on how
+  quickly the `chmod` lands.
 - **The PTY master was marked close-on-exec after the child had been spawned.** Between
   `openpty` and that point, any other session starting concurrently would fork with the
   descriptor open and inherit it — one terminal readable and writable from another session's
@@ -340,14 +340,12 @@ approach above was blind.
   also stop draining the child's output, and a child that both reads and writes would wedge
   against itself. That is not hypothetical: the first version of this fix blocked, and the
   test using `cat` deadlocked in exactly that way.
-- **The UNIX domain socket was created world-connectable.** libwebsockets `chmod`s the socket
-  to `0660` right after binding; this port left it at the process umask, i.e. `0755`, so on a
-  host where `--interface /run/ttyd.sock` is used precisely to restrict access, every local
-  user could open a terminal instead. The same code path also skipped the `chown` to `-u`/`-g`
-  that the C build performs. Both were found by auditing `serve.rs` line by line against
-  `server.c` and `strace`-ing the two binaries side by side, not by any test — the existing
-  socket test asserted `uid == 0` while running as root, which is true whether or not anything
-  happened. It now asserts the mode and chowns to a user that is not the test's own.
+- **The UNIX domain socket was left at the process umask.** libwebsockets `chmod`s it to
+  `0660` right after binding; this port did not, and also skipped the `chown` to `-u`/`-g`.
+  Found by auditing `serve.rs` line by line against `server.c` and `strace`-ing the two
+  binaries side by side, not by any test — the existing socket test asserted `uid == 0` while
+  running as root, which is true whether or not anything happened. It now asserts the mode and
+  chowns to a user that is not the test's own.
 - **The forwarded identity was silently truncated to 29 bytes**, mirroring the C buffer. That
   is worse than it looks: two accounts sharing a 29-byte prefix would collapse onto the same
   `TTYD_USER`. The limit is gone — the name is passed through whole. (The C build refuses the
@@ -443,6 +441,34 @@ and left alone, because changing them would be a divergence rather than a correc
   Xwayland, so `--browser` quietly does nothing there. Again, the C build runs the identical
   probe (`system("xset -q > /dev/null 2>&1")`). Worth fixing upstream in both, not worth
   diverging here.
+
+## A correction: what a UNIX socket's mode actually controls
+
+Earlier revisions of this document, and of the comments in `serve.rs`, described a socket at
+mode `0755` as "world-connectable" and said any local user could open a terminal through it.
+**That is wrong**, and it was repeated in several places before review caught it.
+
+Connecting to a UNIX domain socket requires **write** permission on the socket file.
+Measured directly, connecting as an unprivileged user:
+
+| mode | another user can connect |
+|---|---|
+| `0755` | no — `EACCES` |
+| `0775` | no — `EACCES` |
+| `0777` | **yes** |
+| `0660` | no — `EACCES` |
+| `0666` | **yes** |
+
+So under the usual `0022` umask the un-`chmod`ed socket was `0755` and *already* closed to
+other users; `0755` is in fact stricter for connecting than the `0660` the C build sets,
+which deliberately opens it to the group. The reasons to match `0660` are parity, the group
+access `--socket-owner` exists to grant, and the guarantee that the mode does not depend on
+the umask the server happened to inherit — a process started with `umask 0` binds `0777`,
+which genuinely is open to everyone.
+
+The defect was real; the impact statement was overstated. Recorded rather than quietly
+edited, because a security claim that turns out to be wrong is worth more as a correction
+than as a deletion.
 
 ## Dependencies
 

@@ -48,9 +48,12 @@ pub async fn bind(cfg: &Config) -> Result<Listener> {
             std::fs::remove_file(&path)
                 .with_context(|| format!("cannot remove stale socket {}", path.display()))?;
         }
-        // Created under a umask that already denies everyone else, because `chmod`ing after
-        // the fact leaves a window — however short — in which a local user can connect to a
-        // world-accessible socket and be handed a terminal.
+        // Created under a umask that already denies everyone else, rather than tightened
+        // afterwards. Connecting to a UNIX socket needs *write* permission on it, so what
+        // the umask decides matters: 0755 keeps others out, but a process started with a
+        // permissive umask would bind 0777 and be open to every local user until the chmod
+        // lands. Setting the umask around the bind removes that window rather than reasoning
+        // about how wide it is.
         let listener = {
             let previous = unsafe { libc::umask(0o117) };
             let result = UnixListener::bind(&path);
@@ -113,12 +116,12 @@ fn resolve_bind_address(cfg: &Config) -> Result<IpAddr> {
 /// `chown` to the context's uid/gid — i.e. whatever `-u`/`-g` asked for — then to the
 /// `--socket-owner` pair if one was given, then an unconditional `chmod 0660`.
 ///
-/// The mode is the part that matters, and it is the part this port originally missed.
-/// Without it the socket keeps the process umask, which on a default umask means `0755`:
-/// world-connectable, so any local user on the box gets a terminal. Verified against the C
+/// The mode is the part this port originally missed: without it the socket keeps whatever
+/// the process umask gives it. Connecting needs write permission, so the default 0022 umask
+/// (mode 0755) already keeps other users out — but a umask of 0 yields 0777, which does not,
+/// and `0660` is what the C build guarantees regardless. It also grants the *group* the
+/// access `--socket-owner` exists to hand out, which 0755 denies. Verified against the C
 /// build by `strace`, which shows `chown` followed by `chmod(path, 0660)` on every start.
-/// The caller also binds under a restrictive umask, so the mode here confirms the result
-/// rather than being the only thing standing between the socket and the rest of the box.
 fn apply_socket_permissions(path: &std::path::Path, cfg: &Config) -> Result<()> {
     let uid = cfg.uid.map(nix::unistd::Uid::from_raw);
     let gid = cfg.gid.map(nix::unistd::Gid::from_raw);

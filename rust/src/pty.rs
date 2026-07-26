@@ -173,8 +173,20 @@ impl Pty {
     /// The ceiling is enforced by the caller declining to read more from the socket while
     /// [`Pty::input_backlog_is_full`] holds — see `ws::session`.
     pub fn write(&self, data: Vec<u8>) -> bool {
-        self.queued_input.fetch_add(data.len(), Ordering::AcqRel);
-        self.writer.send(data).is_ok()
+        let len = data.len();
+        self.queued_input.fetch_add(len, Ordering::AcqRel);
+        if self.writer.send(data).is_err() {
+            // Nothing will ever write these bytes, so they must not stay counted. Saturating
+            // because the writer thread zeroes the counter on its way out, and this can lose
+            // the race with it — going negative would wrap and pin the backlog full forever.
+            let _ = self
+                .queued_input
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    Some(queued.saturating_sub(len))
+                });
+            return false;
+        }
+        true
     }
 
     /// Whether the child is far enough behind on input that its client should be made to
