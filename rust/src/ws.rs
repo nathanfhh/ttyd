@@ -338,7 +338,12 @@ async fn await_open(
             let presented = open.auth_token.clone().unwrap_or_default();
             let ok: bool = presented.as_bytes().ct_eq(expected.as_bytes()).into();
             if !ok {
-                tracing::warn!("WS authentication failed with token: {presented}");
+                // The token is the credential itself, so it is described rather than
+                // printed; the C build logs the value and puts it in the operator's logs.
+                tracing::warn!(
+                    "WS authentication failed: token mismatch ({} bytes presented)",
+                    presented.len()
+                );
                 return None;
             }
         }

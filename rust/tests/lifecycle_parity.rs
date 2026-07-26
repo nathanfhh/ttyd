@@ -350,6 +350,37 @@ async fn the_send_buffer_size_bounds_one_output_frame() {
 }
 
 #[tokio::test]
+async fn the_credential_never_reaches_the_log() {
+    // Deliberate divergence: the C build prints the base64 credential in its startup banner
+    // and echoes the presented token when a WebSocket handshake fails. Both are reversible
+    // `user:password`, so anything scraping stdout collects the password.
+    if common::is_c_reference() {
+        return;
+    }
+    let mut server = Server::start(&["-c", "user:pass", "-W", "sh", "-c", "sleep 5"]);
+
+    // A failed handshake must not echo what was presented either.
+    let mut ws = connect_ws(
+        &server.ws_url("/ws"),
+        &[("Authorization", "Basic dXNlcjpwYXNz")],
+    )
+    .await
+    .expect("connect");
+    open_terminal(&mut ws, 80, 24, Some("dXNlcjpwYXNz-wrong"))
+        .await
+        .expect("open");
+    let _ = drain_until_close(&mut ws, Duration::from_secs(5)).await;
+
+    let logs = server.logs();
+    for secret in ["dXNlcjpwYXNz", "user:pass"] {
+        assert!(
+            !logs.contains(secret),
+            "the credential appeared in the server log: {logs}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_websocket_log_records_the_client_address() {
     // The WS line is the only record of who opened a terminal, so it has to name the peer.
     let mut server = Server::start(&["-W", "sh", "-c", "sleep 5"]);

@@ -732,8 +732,11 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
 /// Renders the startup banner the C version writes through `lwsl_notice`.
 pub fn config_summary(cfg: &Config) -> Vec<String> {
     let mut lines = vec!["tty configuration:".to_string()];
-    if let Some(cred) = cfg.credential() {
-        lines.push(format!("  credential: {cred}"));
+    if cfg.credential().is_some() {
+        // Deliberately not the value. It is base64 of `user:password`, i.e. reversible, and
+        // the C build prints it — which puts the password into every log collector that
+        // scrapes stdout.
+        lines.push("  credential: (basic auth enabled)".to_string());
     }
     lines.push(format!("  start command: {}", cfg.command));
     lines.push(format!(
@@ -842,6 +845,22 @@ mod tests {
         let cfg = run(&["ttyd", "--port=7100", "--terminal-type=vt100", "bash"]);
         assert_eq!(cfg.port, 7100);
         assert_eq!(cfg.terminal_type, "vt100");
+    }
+
+    #[test]
+    fn the_startup_summary_never_contains_the_credential() {
+        let cfg = run(&["ttyd", "-c", "user:pass", "bash"]);
+        let summary = config_summary(&cfg).join("\n");
+        assert!(
+            summary.contains("basic auth enabled"),
+            "the summary should still say auth is on: {summary}"
+        );
+        for secret in ["dXNlcjpwYXNz", "user:pass"] {
+            assert!(
+                !summary.contains(secret),
+                "the credential leaked into the startup summary: {summary}"
+            );
+        }
     }
 
     #[test]

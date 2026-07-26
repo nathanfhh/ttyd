@@ -27,22 +27,22 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 83 run against it, all passing | **87.89 %** |
-| Rust port (`rust/src/*.rs`, 2454 lines) | 175 total, all passing | **91.32 %** |
+| C reference (`src/*.c`, 966 lines) | 84 run against it, all passing | **87.89 %** |
+| Rust port (`rust/src/*.rs`, 2454 lines) | 177 total, all passing | **91.32 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 74 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 75 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
 | `ws_parity` | 31 | yes |
 | `tls_parity` | 3 | yes |
-| `lifecycle_parity` | 19 | yes |
+| `lifecycle_parity` | 20 | yes |
 | `forward_auth` | 18 | no — new feature |
 
-77 of the 83 shared tests assert identical behaviour on both binaries. The remaining six
+77 of the 84 shared tests assert identical behaviour on both binaries. The remaining six
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
@@ -143,6 +143,12 @@ Beyond the three divergences, the port makes these changes on purpose:
   second `=` and silently drops the remainder, so `-t token=a=b=c` stored `a`.
 - **404 responses are byte-identical** to what libwebsockets emits, so anything scraping
   error pages sees no change.
+- **Credentials never reach the log.** The C build prints the base64 credential in its
+  startup banner (`server.c`) and echoes the presented token when a WebSocket handshake
+  fails (`protocol.c`). Base64 is encoding, not encryption — both lines put a reversible
+  `user:password` into everything that collects stdout. This port reports that basic auth is
+  enabled without the value, and describes a token mismatch by length instead of printing
+  it. `lifecycle_parity::the_credential_never_reaches_the_log` pins this down.
 
 - **Integer options reject trailing garbage and octal literals.** The C version parses them
   with `strtol(…, 0)`, which accepts `-p 80abc` as port 80 and reads `-p 010` as 8. This port
