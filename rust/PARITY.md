@@ -401,6 +401,51 @@ containing `?1049h` — the real cause was a `.swp` file the *previous* run had 
 which made vim prompt instead of opening. The harness had cross-run state; the fix was a
 fresh directory per run.
 
+## Performance
+
+Both builds are Release: the C build at `-O3 -DNDEBUG`, this one with LTO, one codegen unit
+and symbols stripped. Runs are interleaved — C, Rust, C, Rust — rather than grouped, so
+machine drift lands on both instead of on whichever went second. Each figure is the median of
+five rounds, and the per-round spread is given because a difference smaller than the noise is
+not a difference.
+
+| Measurement | C | Rust | |
+|---|---|---|---|
+| startup to listening (ms) | 4.1 | **2.9** | spreads do not overlap |
+| baseline RSS (kB) | 5016 | 5184 | equal in practice |
+| **RSS per idle session (kB)** | **17.1** | 202.1 | **C wins, 12×** |
+| HTTP `/token` (req/s) | 3848 | **4284** | client-bound; a floor, not a ceiling |
+| terminal sessions (open+close/s) | 297 | **699** | C 270–330, Rust 394–805 |
+| terminal output (MB/s) | 59.1 | **79.4** | C 55.6–59.6, Rust 73.3–80.3 |
+| CPU per MB delivered (ms) | 12.2 | 11.9 | spreads overlap — equal |
+
+The request-rate figures are produced by a Python client that is itself the bottleneck, so
+they are floors rather than measurements of the server's ceiling. The memory, CPU-per-byte
+and startup figures are read from `/proc` on the server and are not client-bound.
+
+An earlier revision of this table read very differently: throughput was within the noise and
+the C build used 23 % less CPU per byte delivered. That was measured before the PTY stopped
+using three OS threads per session — a reader, a writer and a reaper. Removing them (see the
+entry below) did not only reduce memory; it moved throughput and CPU efficiency from "C is
+ahead" to "Rust is ahead or equal", because three threads per session multiplied by the
+client count was scheduler pressure rather than useful work.
+
+**Where C still wins is memory per session, decisively**: 17 kB against 202 kB. At
+`--max-clients 100` that is 1.7 MB against 20 MB. Decomposed by connection stage:
+
+| | RSS per connection |
+|---|---|
+| plain HTTP connection | 64 kB |
+| WebSocket upgraded, no terminal opened | 187 kB |
+| full terminal session | 219 kB |
+
+So the terminal session itself now costs about 30 kB, near the C build's 17.8 kB; the
+remainder is the HTTP/WebSocket layer. A `smaps` diff attributes 138 kB per connection to
+anonymous `mmap`, which points at a single allocation above glibc's 128 kB `mmap` threshold.
+Sizing tungstenite's write buffer down from its 128 kB default changed nothing — 187 kB with
+an 8 kB buffer, 181 kB with a 1 MB one — so that is not the source, and the change was
+reverted rather than kept on a hypothesis. This is an open question, not a solved one.
+
 ## Soak
 
 A ten-minute run with eight concurrent clients connecting, streaming and disconnecting in
