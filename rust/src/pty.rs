@@ -12,13 +12,24 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 /// Size of a single read from the PTY master when `--srv-buf-size` is not set, matching
 /// libuv's suggested buffer size.
 pub const DEFAULT_READ_CHUNK: usize = 65536;
+
+/// How much unwritten terminal input may be queued for one child before the session stops
+/// reading from its client.
+///
+/// A child that is slow to read — or not reading at all — lets the kernel PTY buffer fill,
+/// after which the writer thread blocks in `write`. Everything the client keeps sending
+/// piles up in front of it, so without a ceiling one authenticated writable client can grow
+/// the *server's* memory without bound, and `--max-clients` multiplies that. Reaching the
+/// ceiling stops the session reading its socket until the child catches up, which pushes
+/// back through TCP instead of dropping input or dropping the client.
+pub const MAX_QUEUED_INPUT: usize = 4 * 1024 * 1024;
 
 /// How the child process finished, with the same numbers the C version derives from `waitpid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +53,8 @@ pub struct Pty {
     reaped: Arc<AtomicBool>,
     master: Arc<OwnedFd>,
     writer: mpsc::UnboundedSender<Vec<u8>>,
+    /// Bytes accepted for the child but not yet written to the PTY.
+    queued_input: Arc<AtomicUsize>,
     pub columns: u16,
     pub rows: u16,
 }
@@ -123,8 +136,10 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
     let (exit_tx, exit_rx) = oneshot::channel::<ExitInfo>();
     let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    let queued_input = Arc::new(AtomicUsize::new(0));
+
     spawn_reader(dup_as_file(&master)?, out_tx, req.read_chunk.max(1));
-    spawn_writer(dup_as_file(&master)?, write_rx);
+    spawn_writer(dup_as_file(&master)?, write_rx, queued_input.clone());
     let reaped = Arc::new(AtomicBool::new(false));
     spawn_reaper(child, exit_tx, reaped.clone());
 
@@ -134,6 +149,7 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
             reaped,
             master,
             writer: write_tx,
+            queued_input,
             columns: req.columns,
             rows: req.rows,
         },
@@ -144,8 +160,22 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
 
 impl Pty {
     /// Queues data for the child's terminal input. Returns false once the writer is gone.
+    ///
+    /// This never blocks and never refuses: the caller drives both directions of the session
+    /// from one `select!`, so waiting here would also stop draining the child's output, and a
+    /// child that is simultaneously writing and being written to would wedge against itself.
+    /// The ceiling is enforced by the caller declining to read more from the socket while
+    /// [`Pty::input_backlog_is_full`] holds — see `ws::session`.
     pub fn write(&self, data: Vec<u8>) -> bool {
+        self.queued_input.fetch_add(data.len(), Ordering::AcqRel);
         self.writer.send(data).is_ok()
+    }
+
+    /// Whether the child is far enough behind on input that its client should be made to
+    /// wait. One in-flight chunk may still exceed the ceiling; what matters is that the next
+    /// one is not read until the backlog has drained.
+    pub fn input_backlog_is_full(&self) -> bool {
+        self.queued_input.load(Ordering::Acquire) >= MAX_QUEUED_INPUT
     }
 
     /// Applies a new terminal size. Zero dimensions are ignored, like the C version.
@@ -219,10 +249,18 @@ fn spawn_reader(mut file: std::fs::File, tx: mpsc::Sender<Vec<u8>>, chunk: usize
     });
 }
 
-fn spawn_writer(mut file: std::fs::File, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+fn spawn_writer(
+    mut file: std::fs::File,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+) {
     std::thread::spawn(move || {
         while let Some(chunk) = rx.blocking_recv() {
-            if file.write_all(&chunk).is_err() {
+            let result = file.write_all(&chunk);
+            // Released only once the bytes have reached the PTY, so the ceiling measures
+            // what is actually outstanding rather than what has been handed over.
+            queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+            if result.is_err() {
                 break;
             }
         }
@@ -401,5 +439,67 @@ mod tests {
     async fn spawn_fails_for_a_missing_program() {
         let argv = vec!["/nonexistent/definitely-not-here".to_string()];
         assert!(spawn(req(&argv, &[])).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_child_that_never_reads_makes_its_backlog_report_full() {
+        // `sleep` never reads its terminal, so the kernel PTY buffer fills and the writer
+        // thread blocks. Before the backlog was bounded, every byte sent after that point
+        // was held in the server's memory with nothing to stop it growing.
+        let argv = vec!["/bin/sleep".into(), "60".into()];
+        let s = spawn(req(&argv, &[])).expect("spawn");
+
+        let chunk = vec![b'A'; 64 * 1024];
+        let mut sent = 0usize;
+        // The loop is bounded so a regression fails the test rather than running forever.
+        while sent <= MAX_QUEUED_INPUT * 2 && !s.pty.input_backlog_is_full() {
+            assert!(s.pty.write(chunk.clone()), "writer died unexpectedly");
+            sent += chunk.len();
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            s.pty.input_backlog_is_full(),
+            "wrote {sent} bytes to a child that never reads without the backlog filling"
+        );
+        assert!(
+            sent <= MAX_QUEUED_INPUT + chunk.len(),
+            "backlog reported full only after {sent} bytes, past the {MAX_QUEUED_INPUT} ceiling"
+        );
+
+        let _ = s.pty.kill(9);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_keeps_up_drains_its_backlog() {
+        // The ceiling must be a moving bound, not a per-session budget: a child that reads
+        // lets far more than MAX_QUEUED_INPUT pass through, because the backlog drains as it
+        // goes. `cat` echoes, so its output has to be drained too or it stops reading.
+        let argv = vec!["/bin/cat".into()];
+        let Spawned {
+            pty,
+            mut output,
+            exit: _exit,
+        } = spawn(req(&argv, &[])).expect("spawn");
+        tokio::spawn(async move { while output.recv().await.is_some() {} });
+
+        let chunk = vec![b'x'; 4096];
+        let mut sent = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while sent < MAX_QUEUED_INPUT * 2 {
+            if pty.input_backlog_is_full() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "backlog never drained; {sent} bytes through"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            assert!(pty.write(chunk.clone()), "writer died after {sent} bytes");
+            sent += chunk.len();
+            tokio::task::yield_now().await;
+        }
+
+        let _ = pty.kill(9);
     }
 }

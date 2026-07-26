@@ -298,11 +298,28 @@ where
 /// Serves nothing but permanent redirects to the HTTPS equivalent of the requested URL.
 fn redirect_router() -> Router {
     Router::new().fallback(|request: Request<Body>| async move {
+        // Without an authority there is no such thing as "the HTTPS equivalent" of the
+        // request, and guessing one would point the client somewhere it never asked for.
+        // Emitting `https:///path` — which is what building the URL unconditionally did —
+        // is worse still: a syntactically invalid Location that no client can follow.
         let host = request
             .headers()
             .get(axum::http::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .filter(|h| !h.is_empty())
+            // HTTP/2 carries the authority in the URI rather than in a Host header, as does
+            // an HTTP/1.1 request made in absolute form.
+            .or_else(|| request.uri().authority().map(|a| a.as_str()));
+
+        let Some(host) = host else {
+            // The C build drops the connection here without answering at all. A 400 says the
+            // same thing in a way a client can report.
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::empty())
+                .expect("static response is valid");
+        };
+
         let path = request
             .uri()
             .path_and_query()

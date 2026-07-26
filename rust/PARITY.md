@@ -27,22 +27,22 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 90 run against it, all passing | **88.82 %** |
-| Rust port (`rust/src/*.rs`, 2517 lines) | 188 total, all passing | **92.61 %** |
+| C reference (`src/*.c`, 966 lines) | 93 run against it, all passing | **88.72 %** |
+| Rust port (`rust/src/*.rs`, 2618 lines) | 195 total, all passing | **92.78 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 80 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 84 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
-| `ws_parity` | 31 | yes |
-| `tls_parity` | 3 | yes |
+| `ws_parity` | 33 | yes |
+| `tls_parity` | 4 | yes |
 | `lifecycle_parity` | 26 | yes |
 | `forward_auth` | 18 | no — new feature |
 
-83 of the 90 shared tests assert identical behaviour on both binaries. The remaining seven
+86 of the 93 shared tests assert identical behaviour on both binaries. The remaining seven
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
@@ -217,6 +217,31 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **`--check-origin` accepted origins the C build refuses, and refused ones it accepts.**
+  `check_host_origin` drops `:80` and `:443` from the origin whatever the scheme, and matches
+  the scheme itself exactly and case-sensitively. This port dropped only the scheme's own
+  default port — so `https://host:80` against `Host: host` was rejected where C admits it —
+  and lower-cased the scheme before matching, so `HTTP://` and even `ftp://` were admitted
+  where C turns them away. The second half is the one that matters: being *more* permissive
+  than the reference on a security control is the wrong direction to differ in. Both halves
+  are now pinned by tests that run against both binaries, across the 17 origin forms that
+  were compared by hand.
+- **The HTTPS redirect could emit a URL no client can follow.** A request with no usable
+  authority — HTTP/1.0, which has no required `Host` — produced `Location: https:///token`.
+  The authority now comes from `Host`, falling back to the URI's own authority for HTTP/2 and
+  absolute-form requests, and a request with neither is answered `400 Bad Request` instead.
+  (The C build drops the connection without answering at all.)
+- **Terminal input was queued without limit.** A child that is slow to read, or not reading
+  at all, fills the kernel PTY buffer and blocks the writer thread; everything the client
+  kept sending piled up in the server's memory. Measured: 15 MiB of input aimed at a
+  non-reading child grew RSS by 6.5 MB with nothing to stop it, while the C build absorbed
+  179 MiB for under 1 MB of growth because libwebsockets applies read flow control. The
+  session now stops reading its socket once 4 MiB is outstanding, so the backlog is bounded
+  by TCP backpressure rather than by memory. Gating the read rather than waiting inside it is
+  deliberate — the session drives both directions from one `select!`, so waiting there would
+  also stop draining the child's output, and a child that both reads and writes would wedge
+  against itself. That is not hypothetical: the first version of this fix blocked, and the
+  test using `cat` deadlocked in exactly that way.
 - **The UNIX domain socket was created world-connectable.** libwebsockets `chmod`s the socket
   to `0660` right after binding; this port left it at the process umask, i.e. `0755`, so on a
   host where `--interface /run/ttyd.sock` is used precisely to restrict access, every local
@@ -294,7 +319,14 @@ a loop, sampling the server every 30 seconds:
 792 sessions, 11.2 GB of terminal output, no errors. The RSS figure oscillated between
 9.9 MB and 11.1 MB throughout with no trend; descriptors and threads did not move at all.
 
-The first attempt at this measurement reported the server freezing after three minutes.
+A second run targets the input path rather than the output path: a client floods terminal
+input at a child that never reads, is disconnected or blocked, reconnects, and repeats. Over
+20 such rounds RSS oscillated between 12.2 MB and 13.1 MB and settled at 12.6 MB — the
+backlog ceiling holds per session and is reclaimed when the session ends, rather than
+ratcheting up across reconnects.
+
+The first attempt at the ten-minute measurement reported the server freezing after three
+minutes.
 That was the harness: it read the server's stderr only until the port line appeared, so
 the log filled the 64 kB pipe buffer and the server blocked in `write()`. Recorded because
 the failure looked exactly like a server defect until the stack was inspected — the same

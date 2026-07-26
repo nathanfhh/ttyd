@@ -556,6 +556,54 @@ async fn check_origin_accepts_a_matching_origin() {
 }
 
 #[tokio::test]
+async fn an_origin_carrying_the_other_schemes_default_port_is_accepted() {
+    // `check_host_origin` drops `:80` and `:443` whatever the scheme, so `https://host:80`
+    // compares equal to `Host: host`. Dropping only the scheme's own default rejected it,
+    // which this asserts against both builds so the two cannot drift apart again.
+    // `Host` is overridden so it carries no port; otherwise it would carry the random test
+    // port and none of the default-port cases could arise at all.
+    let server = Server::start(&["-O", "bash"]);
+    for (origin, expected) in [
+        ("http://127.0.0.1", true),
+        ("http://127.0.0.1:80", true),
+        ("https://127.0.0.1:443", true),
+        ("https://127.0.0.1:80", true),
+        ("http://127.0.0.1:443", true),
+        ("http://127.0.0.1:8080", false),
+    ] {
+        let accepted = connect_ws(
+            &server.ws_url("/ws"),
+            &[("Origin", origin), ("Host", "127.0.0.1")],
+        )
+        .await
+        .is_ok();
+        assert_eq!(
+            accepted, expected,
+            "origin {origin} against Host: 127.0.0.1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_origin_with_an_unrecognised_scheme_is_refused() {
+    // The C build parses the origin scheme exactly and case-sensitively, so it turns these
+    // away. Accepting more than the reference does on a security control is the wrong
+    // direction to differ in.
+    let server = Server::start(&["-O", "bash"]);
+    for origin in ["ftp://127.0.0.1", "HTTP://127.0.0.1", "127.0.0.1", "null"] {
+        assert!(
+            connect_ws(
+                &server.ws_url("/ws"),
+                &[("Origin", origin), ("Host", "127.0.0.1")]
+            )
+            .await
+            .is_err(),
+            "origin {origin} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_websocket_path_follows_the_base_path() {
     let server = Server::start(&["-b", "/mounted", "bash"]);
 

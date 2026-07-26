@@ -28,6 +28,10 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 /// code reflects the real exit status.
 const EXIT_STATUS_GRACE: Duration = Duration::from_secs(2);
 
+/// How often to re-check whether the child has drained enough terminal input for its client
+/// to be read from again.
+const INPUT_BACKLOG_RECHECK: Duration = Duration::from_millis(10);
+
 /// Terminal size used until the browser reports its own, matching the C `process_init()`.
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -175,6 +179,17 @@ async fn session(
     let mut output_ended = false;
 
     loop {
+        // Nothing else wakes the loop when the only thing that changed is the writer thread
+        // draining the backlog, so poll for room while the input branch is gated off.
+        let backlog_full = pty.input_backlog_is_full();
+        let backlog_recheck = async {
+            if backlog_full {
+                tokio::time::sleep(INPUT_BACKLOG_RECHECK).await;
+            } else {
+                std::future::pending().await
+            }
+        };
+
         let drain_timer = async {
             match drain_deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -192,7 +207,12 @@ async fn session(
                     break;
                 }
             }
-            incoming = stream.next() => {
+            // Stops reading the socket while the child is behind on input, so the backlog
+            // is bounded by TCP backpressure rather than by the server's memory. Gating this
+            // branch — rather than waiting inside it — keeps output, pings and the exit
+            // status flowing, which is what stops a child that both reads and writes from
+            // wedging against its own session.
+            incoming = stream.next(), if !pty.input_backlog_is_full() => {
                 last_seen = tokio::time::Instant::now();
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
@@ -234,6 +254,7 @@ async fn session(
                 drain_deadline = Some(tokio::time::Instant::now() + DRAIN_AFTER_EXIT);
             }
             _ = drain_timer => break,
+            _ = backlog_recheck => {}
             // A server-wide shutdown must take the child down with it, the same way
             // destroying the libwebsockets context closes every session in the C build.
             _ = state.wait_for_shutdown() => {
@@ -494,14 +515,20 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
 /// for the scheme so that it can be compared with a `Host` header.
 fn normalize_origin(origin: &str) -> Option<String> {
     let (scheme, rest) = origin.split_once("://")?;
+
+    // Matched exactly, and case-sensitively, as `lws_parse_uri` does: the C build refuses an
+    // origin whose scheme it does not know, including `HTTP://`. Accepting more than the
+    // reference does on a security control is the wrong direction to differ in.
+    let implicit_port = match scheme {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if authority.is_empty() {
         return None;
     }
-    let default_port = match scheme.to_ascii_lowercase().as_str() {
-        "https" | "wss" => 443,
-        _ => 80,
-    };
 
     // Only a trailing `:port` counts; an IPv6 literal keeps its brackets and colons.
     let (host, port) = match authority.rsplit_once(':') {
@@ -510,10 +537,13 @@ fn normalize_origin(origin: &str) -> Option<String> {
         {
             (h, p.parse::<u16>().ok()?)
         }
-        _ => (authority, default_port),
+        _ => (authority, implicit_port),
     };
 
-    if port == default_port {
+    // Both default ports are dropped whatever the scheme, which is what `check_host_origin`
+    // does — `if (port == 80 || port == 443)`. Dropping only the scheme's own default would
+    // reject `https://host:80` against `Host: host`, which the C build accepts.
+    if port == 80 || port == 443 {
         Some(host.to_string())
     } else {
         Some(format!("{host}:{port}"))
@@ -585,6 +615,34 @@ mod tests {
             normalize_origin("http://example.com:8080").unwrap(),
             "example.com:8080"
         );
+    }
+
+    #[test]
+    fn both_default_ports_are_dropped_whatever_the_scheme() {
+        // `check_host_origin` drops 80 and 443 unconditionally, so the C build accepts these
+        // against `Host: example.com`. Dropping only the scheme's own default rejected them.
+        assert_eq!(
+            normalize_origin("https://example.com:80").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_origin("http://example.com:443").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_scheme_is_refused() {
+        // The C build refuses these too — its scheme comparison is exact and case-sensitive.
+        assert_eq!(normalize_origin("ftp://example.com"), None);
+        assert_eq!(normalize_origin("HTTP://example.com"), None);
+        assert_eq!(normalize_origin("Https://example.com"), None);
+        assert_eq!(normalize_origin("example.com"), None);
+        assert_eq!(normalize_origin("null"), None);
+        // The four it does recognise.
+        for origin in ["http://a", "https://a", "ws://a", "wss://a"] {
+            assert_eq!(normalize_origin(origin).as_deref(), Some("a"), "{origin}");
+        }
     }
 
     #[test]

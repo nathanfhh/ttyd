@@ -7,6 +7,7 @@ use common::Server;
 use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 fn openssl(args: &[&str], what: &str) {
     let status = Command::new("openssl")
@@ -167,6 +168,53 @@ async fn plain_http_on_the_tls_port_is_redirected() {
         location.starts_with("https://"),
         "expected an https target, got {location}"
     );
+}
+
+#[tokio::test]
+async fn a_redirect_without_a_host_header_is_never_malformed() {
+    // HTTP/1.0 has no required Host. Building the target unconditionally produced
+    // `Location: https:///token` — a URL no client can follow — so the absence of an
+    // authority has to be answered rather than papered over. The C build drops the
+    // connection here; either way, what must never happen is a malformed redirect.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pki = generate_pki(dir.path());
+    let server = Server::start(&[
+        "-S",
+        "-C",
+        pki.server_cert.to_str().unwrap(),
+        "-K",
+        pki.server_key.to_str().unwrap(),
+        "bash",
+    ]);
+
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("connect");
+    socket
+        .write_all(b"GET /token HTTP/1.0\r\n\r\n")
+        .await
+        .expect("write request");
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+
+    assert!(
+        !response.contains("https:///"),
+        "emitted a malformed redirect target: {response}"
+    );
+    // Whatever the answer is, a Location that is present must be a usable absolute URL.
+    for line in response.lines() {
+        if let Some(target) = line.to_ascii_lowercase().strip_prefix("location:") {
+            let target = target.trim().to_string();
+            assert!(
+                target.starts_with("https://") && target.len() > "https://".len(),
+                "Location must name a host, got {target:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
