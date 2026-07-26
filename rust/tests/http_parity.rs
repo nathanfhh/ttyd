@@ -58,6 +58,54 @@ async fn index_is_decompressed_when_gzip_is_not_accepted() {
 }
 
 #[tokio::test]
+async fn an_explicit_gzip_refusal_is_honoured() {
+    // `gzip;q=0` is how RFC 9110 spells "do not send me gzip". The C build asks only whether
+    // the header contains the substring `gzip`, so it answers this by sending a compressed
+    // body the client has just said it cannot decode — the browser then renders the raw
+    // deflate stream. Skipped against C, which cannot pass it by construction.
+    if common::is_c_reference() {
+        return;
+    }
+    let server = Server::start(&["bash"]);
+    for refusal in ["gzip;q=0", "gzip;q=0.0", "deflate, gzip;q=0"] {
+        let response = http_client()
+            .get(server.http_url("/"))
+            .header("Accept-Encoding", refusal)
+            // reqwest would otherwise decode transparently and hide what was sent.
+            .send()
+            .await
+            .expect("request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("content-encoding").is_none(),
+            "{refusal:?} was answered with {:?}",
+            response.headers().get("content-encoding")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_weighted_acceptance_still_gets_gzip() {
+    // The refusal above must not have turned into "any q parameter means no".
+    let server = Server::start(&["bash"]);
+    for accepted in ["gzip;q=1", "gzip;q=0.5", "deflate;q=0, gzip"] {
+        let response = http_client()
+            .get(server.http_url("/"))
+            .header("Accept-Encoding", accepted)
+            .send()
+            .await
+            .expect("request");
+
+        assert_eq!(
+            response.headers()["content-encoding"],
+            "gzip",
+            "{accepted:?} should still be compressed"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_custom_index_replaces_the_bundle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("index.html");

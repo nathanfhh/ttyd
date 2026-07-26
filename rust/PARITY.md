@@ -27,22 +27,22 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 93 run against it, all passing | **88.72 %** |
-| Rust port (`rust/src/*.rs`, 2652 lines) | 197 total, all passing | **92.8 %** |
+| C reference (`src/*.c`, 966 lines) | 95 run against it, all passing | **88.72 %** |
+| Rust port (`rust/src/*.rs`, 2716 lines) | 205 total, all passing | **92.9 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 85 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 91 | no — internal APIs |
 | `cli_parity` | 12 | yes |
-| `http_parity` | 18 | yes |
+| `http_parity` | 20 | yes |
 | `ws_parity` | 33 | yes |
 | `tls_parity` | 4 | yes |
 | `lifecycle_parity` | 26 | yes |
 | `forward_auth` | 19 | no — new feature |
 
-86 of the 93 shared tests assert identical behaviour on both binaries. The remaining seven
+87 of the 95 shared tests assert identical behaviour on both binaries. The remaining eight
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
@@ -158,6 +158,16 @@ Beyond the three divergences, the port makes these changes on purpose:
   and normalized (`mounted` → `/mounted`) rather than reaching the router verbatim, and a
   value containing `{`, `}`, `?` or `#` is rejected — those are route-matching syntax and
   would silently turn the endpoints into wildcard captures.
+- **An explicit `gzip;q=0` is honoured.** Both builds decide whether to compress the index
+  by asking whether `Accept-Encoding` *contains* `gzip` (`strstr` in `http.c`). That answers
+  yes to `gzip;q=0`, which is how RFC 9110 spells "do not send me gzip" — the client then
+  receives a compressed body it has just said it cannot decode, and a browser renders the raw
+  deflate stream. This port parses the header into tokens and honours a zero weight. Measured
+  across ten header forms against both builds; the divergence is confined to `gzip;q=0` (now
+  uncompressed) and `GZIP` (now compressed, since RFC 9110 makes coding names
+  case-insensitive). `*` is deliberately still *not* treated as accepting gzip, matching C —
+  an uncompressed body is acceptable to every client, so there is nothing to gain by
+  differing there.
 - **Log timestamps are UTC**, where the C build prints local time. Deliberate: a container
   with no `TZ` set is UTC anyway, and UTC is easier to correlate across hosts.
 

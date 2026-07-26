@@ -174,12 +174,41 @@ fn html_response(body: Vec<u8>, gzip: bool) -> Response {
     response
 }
 
+/// Whether the client will accept a gzip-encoded body.
+///
+/// The C build asks `strstr(buf, "gzip") != NULL`, which answers yes to
+/// `Accept-Encoding: gzip;q=0` — a client saying, in the way RFC 9110 defines, that it does
+/// *not* want gzip. It then receives a compressed body it has told the server it cannot
+/// decode. This parses the header into tokens instead and honours a `q=0` refusal.
+///
+/// The divergence only ever goes one way, towards sending less compression: `*` is still not
+/// treated as accepting gzip, because an uncompressed body is acceptable to every client and
+/// there is nothing to gain from differing there. `x-gzip` stays accepted, as RFC 9110 lists
+/// it as an alias and the C substring match happens to allow it.
 fn accepts_gzip(request: &Request) -> bool {
-    request
+    let Some(header) = request
         .headers()
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("gzip"))
+    else {
+        return false;
+    };
+
+    header.split(',').any(|entry| {
+        let mut parts = entry.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        if !coding.eq_ignore_ascii_case("gzip") && !coding.eq_ignore_ascii_case("x-gzip") {
+            return false;
+        }
+        // Any weight of zero is a refusal; anything else, including a malformed or absent
+        // parameter, leaves the coding acceptable.
+        !parts.any(|param| {
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("").trim();
+            let value = kv.next().unwrap_or("").trim();
+            key.eq_ignore_ascii_case("q") && value.parse::<f32>() == Ok(0.0)
+        })
+    })
 }
 
 fn log_access(request: &Request) {
@@ -189,4 +218,77 @@ fn log_access(request: &Request) {
         .copied()
         .unwrap_or_default();
     tracing::info!("HTTP {} - {}", request.uri().path(), conn.peer_display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn request(accept_encoding: Option<&str>) -> Request {
+        let mut builder = axum::http::Request::builder().uri("/");
+        if let Some(value) = accept_encoding {
+            builder = builder.header(header::ACCEPT_ENCODING, value);
+        }
+        builder.body(Body::empty()).expect("valid request")
+    }
+
+    #[test]
+    fn gzip_is_accepted_when_offered() {
+        for value in [
+            "gzip",
+            "deflate, gzip",
+            "gzip, br",
+            " gzip ",
+            "gzip;q=1",
+            "gzip;q=0.5",
+        ] {
+            assert!(accepts_gzip(&request(Some(value))), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_is_a_refusal() {
+        // The C build answers yes to all of these because it only looks for the substring,
+        // and then sends a body the client has said it cannot decode.
+        for value in [
+            "gzip;q=0",
+            "gzip;q=0.0",
+            "gzip;q=0.000",
+            "gzip; q=0",
+            "deflate, gzip;q=0",
+        ] {
+            assert!(!accepts_gzip(&request(Some(value))), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn another_codings_refusal_does_not_refuse_gzip() {
+        assert!(accepts_gzip(&request(Some("deflate;q=0, gzip"))));
+        assert!(accepts_gzip(&request(Some("br;q=0, gzip;q=1.0"))));
+    }
+
+    #[test]
+    fn coding_names_are_case_insensitive() {
+        // RFC 9110: content codings are case-insensitive. The C build's `strstr` is not, so
+        // it sends `GZIP` clients an uncompressed body — harmless, but not what they asked.
+        assert!(accepts_gzip(&request(Some("GZIP"))));
+        assert!(accepts_gzip(&request(Some("GZip;Q=1"))));
+        assert!(!accepts_gzip(&request(Some("GZIP;Q=0"))));
+    }
+
+    #[test]
+    fn anything_that_does_not_name_gzip_is_not_gzip() {
+        for value in ["identity", "br, zstd", "deflate", "*", ""] {
+            assert!(!accepts_gzip(&request(Some(value))), "{value:?}");
+        }
+        assert!(!accepts_gzip(&request(None)));
+    }
+
+    #[test]
+    fn the_legacy_alias_is_still_accepted() {
+        // Matching the C build, which accepts it by accident of substring matching.
+        assert!(accepts_gzip(&request(Some("x-gzip"))));
+        assert!(!accepts_gzip(&request(Some("x-gzip;q=0"))));
+    }
 }
