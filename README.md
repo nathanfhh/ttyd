@@ -87,6 +87,58 @@ OPTIONS:
 
 Read the example usage on the [wiki](https://github.com/tsl0922/ttyd/wiki/Example-Usage).
 
+# Rust implementation
+
+This fork also contains a Rust port of the server in [`rust/`](rust). It keeps the command
+line, the HTTP surface and the `tty` WebSocket protocol compatible with the C build — both
+embed the same frontend bundle from `src/html.h` — and adds two things the C build has no
+answer for:
+
+- **Forward authentication** (`--auth-url`): every request, WebSocket upgrade included, is
+  verified against an external endpoint, the way nginx's `auth_request` and Traefik's
+  ForwardAuth middleware work. That lets an existing SSO or auth service protect the
+  terminal instead of a single shared basic-auth credential.
+- **`--title`**: replaces the window title, which otherwise carries the full command line to
+  every client that opens a session.
+
+## Building the Rust implementation
+
+Only a [Rust toolchain](https://rustup.rs) is needed — no libwebsockets, libuv or json-c:
+
+```bash
+cd rust
+cargo build --release
+./target/release/ttyd --help
+# binary at rust/target/release/ttyd
+```
+
+To run it:
+
+```bash
+# same options as the C build
+./target/release/ttyd -W bash
+
+# protected by an external auth service, with the command line hidden
+./target/release/ttyd \
+    --auth-url https://sso.internal/verify \
+    --title "Support Console" \
+    -W bash
+```
+
+The port is validated against the C build with a differential test suite that runs the same
+assertions against both binaries:
+
+```bash
+cd rust
+cargo test                                 # everything, against this build
+./run-parity-tests.sh /path/to/c/ttyd      # and again against the C build, compared
+```
+
+See [rust/README.md](rust/README.md) for the full option reference and
+[rust/PARITY.md](rust/PARITY.md) for what the comparison against the C build found.
+
+Note that Windows is not covered by the Rust port; use the C build there.
+
 ## Browser Support
 
 Modern browsers, See [Browser Support](https://github.com/xtermjs/xterm.js#browser-support).

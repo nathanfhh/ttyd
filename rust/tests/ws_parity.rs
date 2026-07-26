@@ -93,6 +93,33 @@ async fn the_title_carries_the_full_command_line() {
 }
 
 #[tokio::test]
+async fn the_title_option_hides_the_command_line() {
+    // Added by this port: the default title is the full command line, which anyone who can
+    // open a terminal can read. The C build has no way to suppress it.
+    if common::is_c_reference() {
+        return;
+    }
+    let server = Server::start(&[
+        "--title",
+        "Support Console",
+        "-W",
+        "sh",
+        "-c",
+        "sleep 30 # deploy-key-abc123",
+    ]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+
+    let (title, _) = open_session(&mut ws, 80, 24).await;
+    assert_eq!(title, "Support Console");
+    assert!(
+        !title.contains("deploy-key-abc123"),
+        "the command line leaked into the title: {title:?}"
+    );
+}
+
+#[tokio::test]
 async fn client_options_reach_the_browser_as_json() {
     let server = Server::start(&[
         "-t",

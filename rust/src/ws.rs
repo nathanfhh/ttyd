@@ -10,7 +10,6 @@ use crate::http::AuthenticatedUser;
 use crate::protocol::{self, OpenMessage};
 use crate::pty::{self, ExitInfo, SpawnRequest};
 use crate::state::{AppState, ConnInfo};
-use crate::utils;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -128,7 +127,7 @@ async fn session(
     } = spawned;
     tracing::info!("started process, pid: {}", pty.pid);
 
-    let title = format!("{} ({})", state.cfg.command, utils::hostname());
+    let title = state.cfg.window_title();
     for (command, payload) in [
         (protocol::SET_WINDOW_TITLE, title.as_bytes()),
         (protocol::SET_PREFERENCES, state.cfg.prefs_json.as_bytes()),

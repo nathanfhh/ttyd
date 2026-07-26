@@ -138,6 +138,9 @@ pub struct Config {
     pub url_arg: bool,
     pub writable: bool,
     pub terminal_type: String,
+    /// Replaces the window title sent to the browser. Without it the title is the command
+    /// line and host name, which exposes the command to anyone who can open a session.
+    pub title: Option<String>,
     pub prefs_json: String,
     pub check_origin: bool,
     pub max_clients: usize,
@@ -164,6 +167,16 @@ impl Config {
     /// Whether the WebSocket layer must see a matching `AuthToken` before spawning a process.
     pub fn requires_ws_token(&self) -> bool {
         matches!(self.auth, AuthMode::Basic { .. })
+    }
+
+    /// The window title announced to the browser once a terminal opens. It defaults to the
+    /// command line and host name, which `--title` replaces for deployments where the
+    /// command itself should not be visible to whoever opens the terminal.
+    pub fn window_title(&self) -> String {
+        match &self.title {
+            Some(title) => title.clone(),
+            None => format!("{} ({})", self.command, crate::utils::hostname()),
+        }
     }
 
     pub fn is_unix_socket(&self) -> bool {
@@ -197,6 +210,7 @@ impl Default for Config {
             url_arg: false,
             writable: false,
             terminal_type: "xterm-256color".into(),
+            title: None,
             prefs_json: "{ }".into(),
             check_origin: false,
             max_clients: 0,
@@ -253,6 +267,7 @@ const OPTIONS: &[OptSpec] = &[
     opt(Some('a'), "url-arg", false),
     opt(Some('W'), "writable", false),
     opt(Some('T'), "terminal-type", true),
+    opt(None, "title", true),
     opt(Some('t'), "client-option", true),
     opt(Some('O'), "check-origin", false),
     opt(Some('m'), "max-clients", true),
@@ -309,6 +324,9 @@ OPTIONS:
     -W, --writable          Allow clients to write to the TTY (readonly by default)
     -t, --client-option     Send option to client (format: key=value), repeat to add more options
     -T, --terminal-type     Terminal type to report, default: xterm-256color
+        --title             Window title to send to the browser. Without it the title is
+                            the full command line and host name, which every client that
+                            opens a session can read
     -O, --check-origin      Do not allow websocket connection from different origin
     -m, --max-clients       Maximum clients to support (default: 0, no limit)
     -o, --once              Accept only one client and exit on disconnection
@@ -622,6 +640,7 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
             "ssl-key" => cfg.ssl_key = Some(PathBuf::from(truncate(&arg, MAX_SSL_PATH))),
             "ssl-ca" => cfg.ssl_ca = Some(PathBuf::from(truncate(&arg, MAX_SSL_PATH))),
             "terminal-type" => cfg.terminal_type = truncate(&arg, MAX_TERMINAL_TYPE),
+            "title" => cfg.title = Some(arg),
             "client-option" => {
                 // Unlike the C version, the value keeps every character after the first `=`;
                 // the original truncated at a second `=`, silently dropping part of the value.
@@ -697,6 +716,9 @@ pub fn config_summary(cfg: &Config) -> Vec<String> {
         cfg.sig_name, cfg.sig_code
     ));
     lines.push(format!("  terminal type: {}", cfg.terminal_type));
+    if let Some(title) = &cfg.title {
+        lines.push(format!("  window title: {title}"));
+    }
     if !cfg.endpoints.parent.is_empty() {
         lines.push("endpoints:".to_string());
         lines.push(format!("  base-path: {}", cfg.endpoints.parent));
@@ -853,6 +875,40 @@ mod tests {
         assert_eq!(run(&["ttyd", "-s", "SIGTERM", "bash"]).sig_code, 15);
         assert_eq!(run(&["ttyd", "-s", "9", "bash"]).sig_code, 9);
         assert_eq!(run(&["ttyd", "-s", "INT", "bash"]).sig_name, "SIGINT");
+    }
+
+    #[test]
+    fn the_window_title_defaults_to_the_command_and_host() {
+        let title = run(&["ttyd", "sh", "-c", "secret-script.sh"]).window_title();
+        assert!(
+            title.starts_with("sh -c secret-script.sh ("),
+            "title was {title:?}"
+        );
+        assert!(title.ends_with(')'), "title was {title:?}");
+    }
+
+    #[test]
+    fn the_title_option_replaces_the_command_line_entirely() {
+        let cfg = run(&[
+            "ttyd",
+            "--title",
+            "Support Console",
+            "sh",
+            "-c",
+            "secret.sh",
+        ]);
+        assert_eq!(cfg.window_title(), "Support Console");
+        assert!(
+            !cfg.window_title().contains("secret.sh"),
+            "the command line must not leak into an overridden title"
+        );
+    }
+
+    #[test]
+    fn an_empty_title_is_honoured() {
+        // Deliberately blank is a valid way to say "tell the browser nothing".
+        let cfg = run(&["ttyd", "--title", "", "sh", "-c", "secret.sh"]);
+        assert_eq!(cfg.window_title(), "");
     }
 
     #[test]

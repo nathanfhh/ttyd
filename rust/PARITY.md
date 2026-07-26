@@ -27,23 +27,24 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 79 run against it, all passing | **87.89 %** |
-| Rust port (`rust/src/*.rs`, 2161 lines) | 158 total, all passing | **91.67 %** |
+| C reference (`src/*.c`, 966 lines) | 80 run against it, all passing | **87.89 %** |
+| Rust port (`rust/src/*.rs`, 2161 lines) | 162 total, all passing | **91.67 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 64 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 67 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
-| `ws_parity` | 30 | yes |
+| `ws_parity` | 31 | yes |
 | `tls_parity` | 3 | yes |
 | `lifecycle_parity` | 16 | yes |
 | `forward_auth` | 15 | no — new feature |
 
-75 of the 79 shared tests assert identical behaviour on both binaries. The remaining
-four are the documented divergences below.
+76 of the 80 shared tests assert identical behaviour on both binaries. The remaining
+four are the documented divergences below, plus the `--title` test which covers an
+option the C build does not have.
 
 What the remaining ~12 % of uncovered C lines consists of, checked line by line:
 allocation and `lws_write` failure branches, `inflate` failure handling, `fork`/`execvp`
@@ -72,6 +73,13 @@ writable callback that `spawn_process` schedules.
 **Resolution: the port was corrected to match C.** This is not cosmetic — the window
 title contains the full command line, so the original ordering leaked it to any client
 that merely opened a socket, before the `AuthToken` had been checked.
+
+Matching C closes the pre-authentication hole but not the underlying exposure: even in the
+C build, every client that legitimately opens a session receives the full command line. The
+port therefore adds `--title`, which replaces the announced title outright so a command
+carrying a script path, a host or a key never reaches the browser. It is distinct from the
+existing `-t titleFixed=…` client option, which only changes what the browser displays
+after the real title has already been sent over the wire.
 
 ### 2. A clean exit never reaches the browser as close code 1000
 
@@ -135,6 +143,9 @@ Beyond the three divergences, the port makes these changes on purpose:
   second `=` and silently drops the remainder, so `-t token=a=b=c` stored `a`.
 - **404 responses are byte-identical** to what libwebsockets emits, so anything scraping
   error pages sees no change.
+
+Two options are added, and nothing that existed was removed: `--title`, above, and
+`--auth-url` with its companions, documented in [README.md](README.md).
 
 ## Gaps the coverage run exposed
 

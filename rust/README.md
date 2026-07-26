@@ -16,7 +16,27 @@ cargo build --release
 # target/release/ttyd
 ```
 
-The only external requirement is a Rust toolchain — no libwebsockets, libuv or json-c.
+The only external requirement is a [Rust toolchain](https://rustup.rs) — no libwebsockets,
+libuv or json-c. Every command-line option of the C build is accepted, so an existing
+invocation works unchanged:
+
+```sh
+./target/release/ttyd -W bash
+```
+
+## Hiding the command line: `--title`
+
+The window title the server announces defaults to the full command line plus the host name,
+and every client that opens a session receives it. When the command contains anything
+sensitive — a script path, a host, a key — `--title` replaces it outright:
+
+```sh
+ttyd --title "Support Console" -W /opt/ops/reset-account.sh --token abc123
+```
+
+The browser tab then reads `Support Console`, and the command line is never put on the wire.
+This is not the same as the existing `-t titleFixed=…` client option, which only changes what
+the browser displays after the real title has already been sent.
 
 ## Forward authentication
 
@@ -78,7 +98,8 @@ cargo test                                  # everything, against this build
 Every command-line option, HTTP endpoint, WebSocket message type and authentication mode of
 the C implementation is supported. Three behaviours differ on purpose — a clean exit now
 reaches the browser as WebSocket close code 1000, `PAUSE` actually pauses, and basic-auth
-comparison is constant time — each explained in [PARITY.md](PARITY.md).
+comparison is constant time — each explained in [PARITY.md](PARITY.md). `--title`,
+`--auth-url` and its companions are additions; nothing that existed was removed.
 
 **Windows is not ported.** The C build supports it through ConPTY; this port implements the
 Unix PTY path only. A Windows backend fits behind the same `pty` module interface and was
