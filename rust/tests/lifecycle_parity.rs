@@ -691,10 +691,21 @@ async fn the_socket_owner_option_is_applied() {
 
 #[tokio::test]
 async fn a_custom_index_path_expands_a_leading_tilde() {
+    // `~` has to be expanded against a real HOME, so the file cannot live in a tempdir.
+    // A guard removes it even when an assertion below panics, rather than leaving litter in
+    // the developer's home directory.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     let home = std::env::var("HOME").expect("HOME must be set");
     let name = format!(".ttyd-test-index-{}.html", std::process::id());
     let path = std::path::Path::new(&home).join(&name);
     std::fs::write(&path, "<html>tilde index</html>").expect("write");
+    let _cleanup = RemoveOnDrop(path.clone());
 
     let server = Server::start(&["-I", &format!("~/{name}"), "bash"]);
     let body = common::http_client()

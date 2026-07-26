@@ -27,7 +27,7 @@ run_suite_set() {
     for suite in "${SUITES[@]}"; do
         printf '  %-16s ' "$suite"
         if output=$(cargo test --test "$suite" -- --test-threads=4 2>&1); then
-            echo "$(echo "$output" | grep -E '^test result:' | head -1)"
+            echo "$output" | grep -E '^test result:' | head -1
         else
             echo "FAILED"
             echo "$output" | grep -E '^(test .* FAILED|    [a-z_]+$)' | head -20
@@ -44,10 +44,13 @@ echo
 echo "════════════════════════════════════════════════════════════"
 echo "  Unit tests + forward authentication (this port only)"
 echo "════════════════════════════════════════════════════════════"
-for suite in "--lib" "--test forward_auth"; do
-    printf '  %-24s ' "$suite"
-    if output=$(cargo test $suite -- --test-threads=4 2>&1); then
-        echo "$(echo "$output" | grep -E '^test result:' | head -1)"
+# An array per suite, so `--test forward_auth` stays two arguments without relying on
+# unquoted word splitting.
+for suite in "--lib" "--test:forward_auth"; do
+    IFS=':' read -r -a flags <<< "$suite"
+    printf '  %-24s ' "${flags[*]}"
+    if output=$(cargo test "${flags[@]}" -- --test-threads=4 2>&1); then
+        echo "$output" | grep -E '^test result:' | head -1
     else
         echo "FAILED"
         echo "$output" | tail -20

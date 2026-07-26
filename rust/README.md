@@ -47,7 +47,7 @@ integrates with an identity provider. Forward auth fills that gap the same way n
 WebSocket upgrade — is first sent to an endpoint you control, and only a 2xx answer lets it
 through.
 
-```
+```text
 -R, --auth-url            Delegate authentication to this URL
 -F, --auth-request-header Request header to copy into the auth subrequest, repeat to add
                           more (default: Cookie, Authorization)

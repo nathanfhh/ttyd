@@ -8,6 +8,7 @@ verified by their *effect* (files the shell creates), and rendering from a scree
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -23,11 +24,10 @@ WORK = pathlib.Path(f"/tmp/ttyd-browser-{LABEL}")
 # Each run starts from an empty directory, so nothing a previous run left behind (a vim
 # swap file, a stale marker) can change what this one observes.
 
-if WORK.exists():
-    for f in WORK.iterdir():
-        f.unlink()
-else:
-    WORK.mkdir()
+# rmtree rather than unlinking entries: anything that ever leaves a directory behind — a
+# browser profile, an openssl scratch dir — would make `unlink` raise instead of cleaning up.
+shutil.rmtree(WORK, ignore_errors=True)
+WORK.mkdir(parents=True)
 
 IS_C = LABEL == "c"
 USE_TLS = os.environ.get("TTYD_BROWSER_TLS") == "1"
@@ -211,7 +211,13 @@ with sync_playwright() as pw:
     browser.close()
 
 proc.terminate()
-proc.wait(timeout=5)
+try:
+    proc.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    # A server that ignores SIGTERM would otherwise be left running and the script would
+    # raise after the results had already been printed.
+    proc.kill()
+    proc.wait(timeout=5)
 
 print(f"  screenshots: /tmp/ttyd-{LABEL}.png, /tmp/ttyd-{LABEL}-vi.png")
 if USE_TLS:

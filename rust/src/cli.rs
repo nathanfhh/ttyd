@@ -296,6 +296,11 @@ const OPTIONS: &[OptSpec] = &[
     opt(None, "auth-cache-ttl", true),
 ];
 
+/// Largest `--srv-buf-size` accepted. The buffer is allocated once per session, so an
+/// unbounded value is an allocation failure waiting for the first client. 16 MiB is four
+/// thousand times the default and far beyond any useful terminal read.
+const MAX_SRV_BUF_SIZE: u64 = 16 * 1024 * 1024;
+
 fn find_short(c: char) -> Option<&'static OptSpec> {
     OPTIONS.iter().find(|o| o.short == Some(c))
 }
@@ -650,7 +655,19 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
                     return Err(255);
                 }
                 if size > 0 {
-                    cfg.srv_buf_size = size as usize;
+                    // Clamped, because this value is allocated per session: `-f 9999999999999`
+                    // starts fine and then kills the server on the first connection. The C
+                    // build survives the same argument, so crashing there would be a
+                    // regression as well as a denial of service by typo. Reported rather than
+                    // applied silently.
+                    let size = size as u64;
+                    if size > MAX_SRV_BUF_SIZE {
+                        eprintln!(
+                            "ttyd: srv-buf-size {size} is above the {MAX_SRV_BUF_SIZE} byte \
+                             maximum, using {MAX_SRV_BUF_SIZE}"
+                        );
+                    }
+                    cfg.srv_buf_size = size.min(MAX_SRV_BUF_SIZE) as usize;
                 }
             }
             "ipv6" => cfg.ipv6 = true,
@@ -671,10 +688,34 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
                     .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
                 prefs.insert(key.to_string(), value);
             }
-            "auth-url" => forward = Some(ForwardAuthConfig::new(arg)),
+            "auth-url" => {
+                // Validated here rather than per request: a typo would otherwise start
+                // cleanly and then fail every subrequest, and forward auth fails closed —
+                // so the first real traffic turns a typo into a total outage.
+                match arg.parse::<axum::http::Uri>() {
+                    Ok(uri)
+                        if matches!(
+                            uri.scheme_str(),
+                            Some(scheme) if scheme.eq_ignore_ascii_case("http")
+                                || scheme.eq_ignore_ascii_case("https")
+                        ) && uri.authority().is_some() => {}
+                    _ => {
+                        eprintln!("ttyd: invalid auth-url: {arg}");
+                        return Err(255);
+                    }
+                }
+                forward = Some(ForwardAuthConfig::new(arg));
+            }
             "auth-request-header" => forward_request_headers.push(arg),
             "auth-user-header" => forward_user_header = Some(arg),
-            "auth-method" => forward_method = Some(arg.to_ascii_uppercase()),
+            "auth-method" => {
+                let method = arg.to_ascii_uppercase();
+                if axum::http::Method::from_bytes(method.as_bytes()).is_err() {
+                    eprintln!("ttyd: invalid auth-method: {arg}");
+                    return Err(255);
+                }
+                forward_method = Some(method);
+            }
             "auth-cache-ttl" => {
                 forward_cache_ttl = Some(parse_int("auth-cache-ttl", &arg)?.max(0) as u64)
             }
@@ -799,6 +840,17 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_oversized_send_buffer_is_clamped() {
+        // Allocated once per session, so an unbounded value starts cleanly and then kills the
+        // server on the first client — measured, before this cap, as the process dying while
+        // the C build survived the same argument.
+        let cfg = run(&["ttyd", "-f", "9999999999999", "bash"]);
+        assert_eq!(cfg.srv_buf_size, MAX_SRV_BUF_SIZE as usize);
+        // Anything sane is still taken verbatim.
+        assert_eq!(run(&["ttyd", "-f", "65536", "bash"]).srv_buf_size, 65536);
     }
 
     fn run(items: &[&str]) -> Config {

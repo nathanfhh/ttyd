@@ -27,22 +27,22 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 95 run against it, all passing | **88.72 %** |
-| Rust port (`rust/src/*.rs`, 2716 lines) | 205 total, all passing | **92.9 %** |
+| C reference (`src/*.c`, 966 lines) | 97 run against it, all passing | **88.72 %** |
+| Rust port (`rust/src/*.rs`, 2760 lines) | 208 total, all passing | **92.9 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 91 | no — internal APIs |
-| `cli_parity` | 12 | yes |
+| Unit tests (`cargo test --lib`) | 92 | no — internal APIs |
+| `cli_parity` | 14 | yes |
 | `http_parity` | 20 | yes |
 | `ws_parity` | 33 | yes |
 | `tls_parity` | 4 | yes |
 | `lifecycle_parity` | 26 | yes |
 | `forward_auth` | 19 | no — new feature |
 
-87 of the 95 shared tests assert identical behaviour on both binaries. The remaining eight
+89 of the 97 shared tests assert identical behaviour on both binaries. The remaining eight
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
@@ -227,6 +227,16 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **An oversized `--srv-buf-size` killed the server on the first connection.** The value is
+  allocated once per session, and nothing bounded it: `-f 9999999999999` started cleanly and
+  then died the moment a client connected. The C build survives the same argument (its RSS
+  grew to 1.29 GB but it kept serving), so this was a denial of service by typo *and* a
+  regression against the original. The value is now clamped to 16 MiB, with the clamp
+  reported rather than applied silently.
+- **`--auth-url` and `--auth-method` were accepted unvalidated.** Forward auth fails closed,
+  so a typo in the URL started cleanly and then answered every request `500` — a typo turned
+  into a total outage at first traffic instead of a startup error. Both are now checked while
+  parsing.
 - **A query string could panic the connection task.** `decode_query_value` read `%XX`
   escapes by slicing the `&str` at byte offsets, which are not character boundaries: `?arg=%aé`
   slices into the middle of `é` and panics. The query string comes straight off the wire, so

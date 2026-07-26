@@ -111,6 +111,45 @@ fn a_non_numeric_integer_option_exits_one() {
 }
 
 #[test]
+fn a_malformed_auth_url_is_rejected_at_startup() {
+    // Forward auth fails closed, so a typo here would start cleanly and then turn the first
+    // real traffic into a total outage — every request answered 500 by a subrequest that can
+    // never succeed. Better to refuse to start.
+    if common::is_c_reference() {
+        return; // The C build has no forward auth.
+    }
+    for bad in ["notaurl", "ftp://host/verify", "http:///no-host"] {
+        let result = run_cli(&["--auth-url", bad, "bash"]);
+        assert_eq!(result.code, 255, "{bad} was accepted");
+        assert!(
+            result.stderr.contains("invalid auth-url"),
+            "{bad}: stderr was {:?}",
+            result.stderr
+        );
+    }
+}
+
+#[test]
+fn a_malformed_auth_method_is_rejected_at_startup() {
+    if common::is_c_reference() {
+        return;
+    }
+    let result = run_cli(&[
+        "--auth-url",
+        "http://x/v",
+        "--auth-method",
+        "BAD METHOD",
+        "bash",
+    ]);
+    assert_eq!(result.code, 255);
+    assert!(
+        result.stderr.contains("invalid auth-method"),
+        "stderr was {:?}",
+        result.stderr
+    );
+}
+
+#[test]
 fn a_missing_custom_index_is_rejected() {
     let result = run_cli(&["-I", "/nonexistent/index.html", "bash"]);
     assert_eq!(result.code, 255);

@@ -15,7 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    emit_version();
+    emit_version(&manifest_dir);
 
     let (gzip, uncompressed_size) = parse_header(&header);
 
@@ -33,7 +33,7 @@ fn main() {
 
 /// Reproduces the CMake version scheme, `<crate version>-<short git hash>`, so that
 /// `ttyd --version` matches what the C build reports for the same commit.
-fn emit_version() {
+fn emit_version(manifest_dir: &Path) {
     let base = env::var("CARGO_PKG_VERSION").unwrap();
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -61,7 +61,11 @@ fn emit_version() {
     let head_dir = git_path(&["rev-parse", "--absolute-git-dir"]);
     // A linked worktree has its own HEAD but shares refs/ and packed-refs with the main
     // checkout, so the two can be different directories.
+    // `--path-format=absolute` needs git 2.31. On anything older that call fails, and
+    // `--git-common-dir` alone answers relative to the working directory — which is this
+    // manifest directory — so it has to be resolved rather than used as written.
     let refs_dir = git_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .or_else(|| git_path(&["rev-parse", "--git-common-dir"]).map(|p| manifest_dir.join(p)))
         .or_else(|| head_dir.clone());
 
     let Some(head_dir) = head_dir else { return };
@@ -132,6 +136,16 @@ fn parse_header(path: &Path) -> (Vec<u8>, usize) {
         "{}: parsed {} bytes but index_html_len says {declared_len}",
         path.display(),
         bytes.len()
+    );
+    // `find('{')` keys off the first brace anywhere in the header, so a header shaped
+    // differently could parse to the wrong offset. The length check catches most of that;
+    // the gzip magic makes the rest fail here rather than at the first decompression, which
+    // happens at runtime in `html::index_html_plain`.
+    assert_eq!(
+        bytes.get(..2),
+        Some([0x1f, 0x8b].as_slice()),
+        "{}: parsed payload is not gzip",
+        path.display()
     );
 
     (bytes, declared_size)

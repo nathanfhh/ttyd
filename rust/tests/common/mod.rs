@@ -74,8 +74,11 @@ impl Server {
                 });
             }
         }
+        // stdout is discarded rather than piped: nothing reads it, so a server that wrote
+        // more than the pipe buffer would block in `write` and look like a hang. That is the
+        // same trap the soak harness fell into with stderr, which this suite does drain.
         command
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
 
