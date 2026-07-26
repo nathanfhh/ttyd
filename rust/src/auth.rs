@@ -6,7 +6,7 @@
 //! authentication, where every request is validated against an external endpoint the way
 //! nginx's `auth_request` and Traefik's ForwardAuth middleware do.
 
-use crate::cli::{AuthMode, ForwardAuthConfig, MAX_USER};
+use crate::cli::{AuthMode, ForwardAuthConfig};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -15,6 +15,10 @@ use subtle::ConstantTimeEq;
 
 /// How long to wait for the forward-auth endpoint before giving up.
 const FORWARD_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on cached auth decisions; the key space is bounded by the number of
+/// simultaneously active callers, not by traffic volume.
+const AUTH_CACHE_CAPACITY: u64 = 1024;
 
 /// Headers copied from the auth endpoint's rejection back to the browser. These carry the
 /// information a user needs to actually authenticate: a challenge, a login redirect, or a
@@ -90,7 +94,7 @@ impl Authenticator {
                     .build()?;
                 let cache = (config.cache_ttl > 0).then(|| {
                     moka::sync::Cache::builder()
-                        .max_capacity(1024)
+                        .max_capacity(AUTH_CACHE_CAPACITY)
                         .time_to_live(Duration::from_secs(config.cache_ttl))
                         .build()
                 });
@@ -161,7 +165,7 @@ fn check_trusted_header(headers: &HeaderMap, name: &str) -> Decision {
 
     match value {
         Some(user) => Decision::Allow {
-            user: Some(truncate_user(user)),
+            user: Some(keep_user(user)),
         },
         None => Decision::deny(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
@@ -172,10 +176,14 @@ fn check_trusted_header(headers: &HeaderMap, name: &str) -> Decision {
 }
 
 async fn check_forward(state: &ForwardState, ctx: &RequestContext<'_>) -> Decision {
-    let forwarded = collect_forwarded_headers(state, ctx);
+    // The endpoint is entitled to decide on anything the subrequest carries, so the cache
+    // key is derived from that exact set. Keying on less would replay one caller's verdict
+    // for a request the endpoint would have refused.
+    let subrequest_headers = build_subrequest_headers(state, ctx);
+    let key = cache_key(ctx.method.as_str(), ctx.uri, &subrequest_headers);
 
     if let Some(cache) = &state.cache {
-        if let Some(user) = cache.get(&cache_key(ctx.uri, &forwarded)) {
+        if let Some(user) = cache.get(&key) {
             return Decision::Allow { user };
         }
     }
@@ -184,10 +192,7 @@ async fn check_forward(state: &ForwardState, ctx: &RequestContext<'_>) -> Decisi
         reqwest::Method::from_bytes(state.config.method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut request = state.client.request(method, &state.config.url);
 
-    for (name, value) in &forwarded {
-        request = request.header(name, value);
-    }
-    for (name, value) in original_request_metadata(ctx) {
+    for (name, value) in &subrequest_headers {
         request = request.header(name, value);
     }
 
@@ -211,10 +216,10 @@ async fn check_forward(state: &ForwardState, ctx: &RequestContext<'_>) -> Decisi
             .get(&state.config.user_header)
             .and_then(|v| v.to_str().ok())
             .filter(|v| !v.is_empty())
-            .map(truncate_user);
+            .map(keep_user);
 
         if let Some(cache) = &state.cache {
-            cache.insert(cache_key(ctx.uri, &forwarded), user.clone());
+            cache.insert(key, user.clone());
         }
         return Decision::Allow { user };
     }
@@ -249,44 +254,50 @@ fn collect_forwarded_headers(
     out
 }
 
+/// Everything the auth subrequest carries: the operator's chosen request headers plus the
+/// description of the original request. Built once and used for both the outgoing headers
+/// and the cache key, so the two can never drift apart.
+fn build_subrequest_headers(
+    state: &ForwardState,
+    ctx: &RequestContext<'_>,
+) -> Vec<(String, String)> {
+    let mut out = collect_forwarded_headers(state, ctx);
+    out.extend(original_request_metadata(ctx));
+    out
+}
+
 /// The `X-Original-*` / `X-Forwarded-*` set that nginx and Traefik both send, so existing
 /// auth services work unchanged.
-fn original_request_metadata(ctx: &RequestContext<'_>) -> Vec<(&'static str, String)> {
+fn original_request_metadata(ctx: &RequestContext<'_>) -> Vec<(String, String)> {
     let mut out = vec![
-        ("x-original-method", ctx.method.to_string()),
-        ("x-original-uri", ctx.uri.to_string()),
-        ("x-forwarded-method", ctx.method.to_string()),
-        ("x-forwarded-uri", ctx.uri.to_string()),
+        ("x-original-method".to_string(), ctx.method.to_string()),
+        ("x-original-uri".to_string(), ctx.uri.to_string()),
+        ("x-forwarded-method".to_string(), ctx.method.to_string()),
+        ("x-forwarded-uri".to_string(), ctx.uri.to_string()),
         (
-            "x-forwarded-proto",
-            if ctx.tls {
-                "https".into()
-            } else {
-                "http".to_string()
-            },
+            "x-forwarded-proto".to_string(),
+            if ctx.tls { "https" } else { "http" }.to_string(),
         ),
     ];
     if let Some(host) = ctx.headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        out.push(("x-forwarded-host", host.to_string()));
+        out.push(("x-forwarded-host".to_string(), host.to_string()));
     }
     if let Some(peer) = ctx.peer {
-        let chain = match ctx
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-        {
-            Some(existing) => format!("{existing}, {peer}"),
-            None => peer.to_string(),
-        };
-        out.push(("x-forwarded-for", chain));
+        // Only the address we observed ourselves. ttyd running forward auth is normally the
+        // edge, so there is no trusted hop upstream and a client-supplied X-Forwarded-For is
+        // just an attacker-chosen string — appending to it would let the caller prepend any
+        // address it likes for an endpoint that reads the chain from the left.
+        out.push(("x-forwarded-for".to_string(), peer.to_string()));
     }
     out
 }
 
-fn cache_key(uri: &str, forwarded: &[(String, String)]) -> String {
-    let mut key = String::with_capacity(uri.len() + 64);
+fn cache_key(method: &str, uri: &str, subrequest_headers: &[(String, String)]) -> String {
+    let mut key = String::with_capacity(uri.len() + 128);
+    key.push_str(method);
+    key.push('\u{3}');
     key.push_str(uri);
-    for (name, value) in forwarded {
+    for (name, value) in subrequest_headers {
         key.push('\u{1}');
         key.push_str(name);
         key.push('\u{2}');
@@ -295,17 +306,15 @@ fn cache_key(uri: &str, forwarded: &[(String, String)]) -> String {
     key
 }
 
-/// The child process environment reserves 29 bytes for the user name, matching the C
-/// `pss_tty.user` buffer.
-fn truncate_user(user: &str) -> String {
-    if user.len() <= MAX_USER {
-        return user.to_string();
-    }
-    let mut end = MAX_USER;
-    while end > 0 && !user.is_char_boundary(end) {
-        end -= 1;
-    }
-    user[..end].to_string()
+/// The identity is passed through whole.
+///
+/// The C build copies it into a `char[30]`, and `lws_hdr_custom_copy` refuses outright when
+/// the value does not fit — so an account name of 30 bytes or more cannot open a terminal
+/// there at all. Truncating instead would be worse than refusing: two distinct accounts
+/// sharing a 29-byte prefix would collapse onto the same `TTYD_USER`. With no fixed buffer
+/// here, neither compromise is necessary.
+fn keep_user(user: &str) -> String {
+    user.to_string()
 }
 
 #[cfg(test)]
@@ -392,15 +401,59 @@ mod tests {
     }
 
     #[test]
-    fn user_names_are_truncated_to_the_env_buffer() {
+    fn long_user_names_survive_intact() {
+        // Truncating would alias two accounts sharing a prefix onto one TTYD_USER.
         let long = "u".repeat(100);
-        assert_eq!(truncate_user(&long).len(), MAX_USER);
+        let h = headers(&[("x-remote-user", &long)]);
+        assert_eq!(
+            check_trusted_header(&h, "x-remote-user").user(),
+            Some(long.as_str())
+        );
     }
 
     #[test]
     fn cache_keys_separate_distinct_credentials() {
-        let a = cache_key("/", &[("cookie".into(), "session=a".into())]);
-        let b = cache_key("/", &[("cookie".into(), "session=b".into())]);
+        let a = cache_key("GET", "/", &[("cookie".into(), "session=a".into())]);
+        let b = cache_key("GET", "/", &[("cookie".into(), "session=b".into())]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cache_keys_separate_distinct_methods_and_forwarded_metadata() {
+        // Everything the subrequest carries must move the key, or a verdict granted for one
+        // request gets replayed for another the endpoint would have refused.
+        let headers = [("x-forwarded-for".to_string(), "10.0.0.1".to_string())];
+        assert_ne!(
+            cache_key("GET", "/", &headers),
+            cache_key("HEAD", "/", &headers)
+        );
+        assert_ne!(
+            cache_key("GET", "/", &headers),
+            cache_key(
+                "GET",
+                "/",
+                &[("x-forwarded-for".to_string(), "10.0.0.2".to_string())]
+            )
+        );
+        assert_ne!(cache_key("GET", "/", &headers), cache_key("GET", "/", &[]));
+    }
+
+    #[test]
+    fn the_forwarded_address_is_the_observed_peer_only() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        let ctx = RequestContext {
+            method: &Method::GET,
+            uri: "/",
+            headers: &h,
+            peer: Some("203.0.113.9".parse().unwrap()),
+            tls: false,
+        };
+        let sent = original_request_metadata(&ctx);
+        let xff = sent
+            .iter()
+            .find(|(n, _)| n == "x-forwarded-for")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(xff, Some("203.0.113.9"));
     }
 }

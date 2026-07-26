@@ -70,6 +70,11 @@ Behaviour worth knowing:
 - The subrequest carries `X-Original-Method`, `X-Original-URI`, `X-Forwarded-Method`,
   `X-Forwarded-Uri`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Forwarded-For`, so
   services written for nginx or Traefik work unchanged.
+- `X-Forwarded-For` carries **only the address ttyd itself observed**. A client-supplied
+  `X-Forwarded-For` is discarded rather than appended to, because ttyd running forward auth
+  is normally the edge: there is no trusted hop upstream, so anything the client sent is
+  attacker-chosen. `X-Forwarded-Host`, in contrast, is by definition the client's own `Host`
+  header — treat it as untrusted input in your auth service.
 - A non-2xx answer is relayed to the browser along with `WWW-Authenticate`,
   `Proxy-Authenticate`, `Location`, `Set-Cookie` and `Cache-Control`. A `302` to your login
   page therefore works end to end.
@@ -77,10 +82,21 @@ Behaviour worth knowing:
   admits anyone.
 - Only successful decisions are cached. Caching a denial would keep a user locked out for
   the rest of the TTL after they had logged in.
-- The cache key includes every forwarded header value, so one user's verdict is never
-  reused for another.
+- The cache key is derived from the **complete set of inputs the subrequest carries** — the
+  method, the URI, the forwarded request headers and every `X-Forwarded-*` / `X-Original-*`
+  value. Whatever your endpoint is entitled to decide on is part of the key, so a verdict is
+  never replayed for a request the endpoint would have refused.
 - `--auth-url` takes precedence over `--credential` and `--auth-header`, and the `/token`
   endpoint stops handing out a credential.
+
+Operating limits worth planning for:
+
+- Every request that is not served from the cache produces one subrequest, and rejections
+  are deliberately never cached — so unauthenticated traffic, the kind an attacker fully
+  controls, always reaches your identity provider. Put a rate-limiting reverse proxy in
+  front of ttyd if it is exposed to the open internet.
+- Because an unreachable endpoint fails closed with `500`, an auth-service outage takes the
+  terminal down with it. That is the intended trade; size the endpoint accordingly.
 
 ## Testing
 

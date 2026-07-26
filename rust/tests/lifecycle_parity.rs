@@ -104,31 +104,60 @@ async fn the_configured_signal_is_sent_when_the_client_leaves() {
 
 #[tokio::test]
 async fn privileges_are_dropped_for_the_child() {
+    /// A group id that exists nowhere else, so finding it in the child is unambiguous.
+    const MARKER_GROUP: u32 = 60123;
+
     // Only meaningful when the test process can actually change user.
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
+    // The server is started holding a supplementary group so the test can prove it is
+    // dropped; `id -G` is comma-joined because its native output is space-separated and
+    // would otherwise be truncated when the line is parsed.
     // 65534 is `nobody` on Debian and Ubuntu, where this suite runs.
-    let server = Server::start(&[
-        "-u",
-        "65534",
-        "-g",
-        "65534",
-        "-W",
-        "sh",
-        "-c",
-        "id -u; sleep 5",
-    ]);
+    let server = Server::start_with_supplementary_groups(
+        &[
+            "-u",
+            "65534",
+            "-g",
+            "65534",
+            "-W",
+            "sh",
+            "-c",
+            "echo IDENTITY=$(id -u):$(id -g):$(id -G | tr ' ' ','); sleep 5",
+        ],
+        &[MARKER_GROUP],
+    );
 
     let mut ws = connect_ws(&server.ws_url("/ws"), &[])
         .await
         .expect("connect");
     open_session(&mut ws).await;
 
-    let seen = read_until(&mut ws, "65534", LONG).await;
+    let seen = read_until(&mut ws, "IDENTITY=", LONG).await;
+    let identity = seen
+        .split("IDENTITY=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_string();
     assert!(
-        seen.contains("65534"),
-        "the child did not run as the requested uid: {seen:?}"
+        identity.starts_with("65534:65534:"),
+        "the child did not run as the requested uid/gid: {seen:?}"
+    );
+
+    // Dropping privileges must also drop the supplementary groups the server was started
+    // with — setgid() alone leaves them in place, so a shell would keep whatever groups the
+    // operator's own session had (docker, adm, ...).
+    let groups = identity.rsplit(':').next().unwrap_or_default();
+    let leftovers: Vec<&str> = groups
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != "65534")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "supplementary groups survived the privilege drop: {leftovers:?} (full: {identity})"
     );
 }
 
@@ -276,6 +305,93 @@ async fn shutting_the_server_down_takes_the_child_with_it() {
 }
 
 #[tokio::test]
+async fn the_send_buffer_size_bounds_one_output_frame() {
+    // Regression: --srv-buf-size used to be parsed and then never read, so the option was a
+    // silent no-op. It now bounds how much terminal output travels in a single frame.
+    if common::is_c_reference() {
+        // The C build spends this on the libwebsockets service buffer, which is not
+        // observable as a frame size from the client side.
+        return;
+    }
+    let server = Server::start(&[
+        "-f",
+        "1024",
+        "-W",
+        "sh",
+        "-c",
+        "i=0; while [ $i -lt 400 ]; do echo bulk-output-line-$i; i=$((i+1)); done; echo BURST-DONE; sleep 3",
+    ]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws).await;
+
+    let mut largest = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut done = false;
+    while tokio::time::Instant::now() < deadline && !done {
+        match common::next_data_frame(&mut ws, Duration::from_secs(3)).await {
+            Some(frame) if frame.first() == Some(&b'0') => {
+                largest = largest.max(frame.len() - 1);
+                done = String::from_utf8_lossy(&frame[1..]).contains("BURST-DONE");
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        done,
+        "the burst never completed; largest frame seen {largest}"
+    );
+    assert!(
+        largest <= 1024,
+        "an output frame carried {largest} bytes despite --srv-buf-size 1024"
+    );
+}
+
+#[tokio::test]
+async fn the_websocket_log_records_the_client_address() {
+    // The WS line is the only record of who opened a terminal, so it has to name the peer.
+    let mut server = Server::start(&["-W", "sh", "-c", "sleep 5"]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws).await;
+    assert!(
+        server.wait_for_log("pid:", Duration::from_secs(10)),
+        "the session never started"
+    );
+
+    let ws_line = server
+        .logs()
+        .lines()
+        .find(|line| line.contains("WS ") && line.contains("clients:"))
+        .map(str::to_string)
+        .expect("no WS log line was emitted");
+    assert!(
+        ws_line.contains("127.0.0.1"),
+        "the WS log line does not name the client address: {ws_line}"
+    );
+}
+
+#[tokio::test]
+async fn a_base_path_without_a_leading_slash_still_starts() {
+    // Regression: this used to reach the router verbatim and panic after the banner. The C
+    // build starts but builds unreachable endpoints (`mounted/token` matches no request
+    // path), so normalizing is a deliberate divergence rather than shared behaviour.
+    if common::is_c_reference() {
+        return;
+    }
+    let server = Server::start(&["-b", "mounted", "bash"]);
+    let response = common::http_client()
+        .get(server.http_url("/mounted/token"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
 async fn the_server_pings_idle_sessions() {
     // Without periodic pings a terminal nobody is typing into gets dropped by reverse
     // proxies and NAT devices after their idle timeout.
@@ -309,6 +425,10 @@ async fn the_server_pings_idle_sessions() {
 
 #[tokio::test]
 async fn the_socket_owner_option_is_applied() {
+    // chown to another owner requires root; without it the option cannot be exercised at all.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("owned.sock");
 

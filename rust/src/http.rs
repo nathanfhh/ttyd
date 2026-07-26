@@ -102,7 +102,7 @@ async fn add_server_header(request: Request, next: Next) -> Response {
 }
 
 async fn index(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    log_access(&state, &request);
+    log_access(&request);
 
     if let Some(path) = &state.cfg.index {
         return match tokio::fs::read(path).await {
@@ -124,7 +124,7 @@ async fn index(State(state): State<Arc<AppState>>, request: Request) -> Response
 }
 
 async fn token(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    log_access(&state, &request);
+    log_access(&request);
 
     let credential = state.cfg.credential().unwrap_or("");
     let body = format!("{{\"token\": \"{credential}\"}}");
@@ -139,7 +139,7 @@ async fn token(State(state): State<Arc<AppState>>, request: Request) -> Response
 }
 
 async fn redirect_to_index(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    log_access(&state, &request);
+    log_access(&request);
 
     let location = HeaderValue::from_str(&state.cfg.endpoints.index)
         .unwrap_or_else(|_| HeaderValue::from_static("/"));
@@ -150,8 +150,8 @@ async fn redirect_to_index(State(state): State<Arc<AppState>>, request: Request)
 /// look the same to anything that scrapes them.
 const NOT_FOUND_BODY: &str = "<html><head><meta charset=utf-8 http-equiv=\"Content-Language\" content=\"en\"/><link rel=\"stylesheet\" type=\"text/css\" href=\"/error.css\"/></head><body><h1>404</h1></body></html>";
 
-async fn not_found(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    log_access(&state, &request);
+async fn not_found(request: Request) -> Response {
+    log_access(&request);
     (
         StatusCode::NOT_FOUND,
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
@@ -182,12 +182,11 @@ fn accepts_gzip(request: &Request) -> bool {
         .is_some_and(|v| v.contains("gzip"))
 }
 
-fn log_access(state: &AppState, request: &Request) {
+fn log_access(request: &Request) {
     let conn = request
         .extensions()
         .get::<ConnInfo>()
         .copied()
         .unwrap_or_default();
-    let _ = state;
     tracing::info!("HTTP {} - {}", request.uri().path(), conn.peer_display());
 }

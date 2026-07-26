@@ -346,6 +346,92 @@ async fn distinct_credentials_are_cached_separately() {
 }
 
 #[tokio::test]
+async fn a_verdict_is_not_reused_across_different_request_metadata() {
+    // Regression: the cache key must cover everything the auth subrequest carries, not just
+    // the headers named by --auth-request-header. ttyd also sends X-Forwarded-For,
+    // X-Original-Method and friends, and an auth service is entitled to decide on them; if
+    // they are missing from the key, a grant issued for one request is replayed for another
+    // the endpoint would have rejected.
+    if is_c_reference() {
+        return;
+    }
+    let auth = MockAuth::start(Reply::ok()).await;
+    let server = Server::start(&["--auth-url", &auth.url(), "--auth-cache-ttl", "60", "bash"]);
+
+    let client = http_client();
+    // Same path, same (absent) cookie — the two requests differ only in the Host, which ttyd
+    // forwards as X-Forwarded-Host and an auth service may legitimately decide on.
+    for host in ["alpha.example", "beta.example"] {
+        client
+            .get(server.http_url("/token"))
+            .header("Host", host)
+            .send()
+            .await
+            .expect("request");
+    }
+
+    let hosts: Vec<String> = auth
+        .requests()
+        .iter()
+        .filter_map(|r| r.headers.get("x-forwarded-host")?.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        hosts,
+        vec!["alpha.example", "beta.example"],
+        "a verdict was replayed for a request carrying different forwarded metadata"
+    );
+}
+
+#[tokio::test]
+async fn the_method_is_part_of_the_cache_key() {
+    if is_c_reference() {
+        return;
+    }
+    let auth = MockAuth::start(Reply::ok()).await;
+    let server = Server::start(&["--auth-url", &auth.url(), "--auth-cache-ttl", "60", "bash"]);
+
+    let client = http_client();
+    client.get(server.http_url("/")).send().await.expect("get");
+    client
+        .head(server.http_url("/"))
+        .send()
+        .await
+        .expect("head");
+
+    assert_eq!(
+        auth.requests().len(),
+        2,
+        "GET and HEAD shared a cached verdict despite being distinct to the endpoint"
+    );
+}
+
+#[tokio::test]
+async fn the_client_cannot_choose_its_own_forwarded_address() {
+    // ttyd with --auth-url is normally the edge, so there is no trusted hop upstream: the
+    // peer address it observes is the only trustworthy one.
+    if is_c_reference() {
+        return;
+    }
+    let auth = MockAuth::start(Reply::ok()).await;
+    let server = Server::start(&["--auth-url", &auth.url(), "bash"]);
+
+    http_client()
+        .get(server.http_url("/"))
+        .header("X-Forwarded-For", "10.0.0.1")
+        .send()
+        .await
+        .expect("request");
+
+    let requests = auth.requests();
+    let seen = requests.first().expect("one request");
+    assert_eq!(
+        seen.headers["x-forwarded-for"], "127.0.0.1",
+        "the client's own X-Forwarded-For must not reach the auth endpoint"
+    );
+}
+
+#[tokio::test]
 async fn rejections_are_never_cached() {
     if is_c_reference() {
         return;

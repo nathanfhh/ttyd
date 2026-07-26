@@ -18,8 +18,6 @@ const MAX_SOCKET_OWNER: usize = 127;
 const MAX_TERMINAL_TYPE: usize = 29;
 const MAX_BASE_PATH: usize = 127;
 const MAX_SSL_PATH: usize = 1023;
-/// `pss_tty.user` is `char[30]`, so the forwarded identity is capped at 29 bytes.
-pub const MAX_USER: usize = 29;
 
 /// URL paths the server answers on, shifted by `--base-path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,17 +40,30 @@ impl Default for Endpoints {
 }
 
 impl Endpoints {
-    fn with_base_path(base: &str) -> Self {
+    /// Builds the endpoint set for a `--base-path` value.
+    ///
+    /// The value reaches the router verbatim, so it is normalized and checked here: a
+    /// missing leading slash is a common typo worth accepting, but braces are route-capture
+    /// syntax and would silently turn the endpoints into wildcard matches.
+    fn with_base_path(base: &str) -> Result<Self, String> {
         let trimmed = base.trim_end_matches('/');
         if trimmed.is_empty() {
-            return Self::default();
+            return Ok(Self::default());
         }
-        Self {
-            ws: format!("{trimmed}/ws"),
-            index: format!("{trimmed}/"),
-            token: format!("{trimmed}/token"),
-            parent: trimmed.to_string(),
+        let normalized = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{trimmed}")
+        };
+        if normalized.contains(['{', '}', '?', '#']) {
+            return Err(format!("ttyd: invalid base path: {base}"));
         }
+        Ok(Self {
+            ws: format!("{normalized}/ws"),
+            index: format!("{normalized}/"),
+            token: format!("{normalized}/token"),
+            parent: normalized,
+        })
     }
 }
 
@@ -363,6 +374,12 @@ Visit https://github.com/tsl0922/ttyd to get more information and report bugs.
 
 /// Locates the first non-option argument, which is where the child command begins.
 /// Mirrors how the C version derives `start` from `getopt_long`'s `optind`.
+///
+/// This walks arguments by the same rules as [`collect_options`] — `--`, inline `=` values,
+/// short-option clusters, unknown options consuming nothing. **The two must stay in
+/// agreement**: if they disagree, the command would start in a different place than the
+/// options were parsed from, and nothing would fail to compile.
+/// `command_start_agrees_with_option_parsing` guards the pair.
 fn find_command_start(args: &[String]) -> usize {
     let mut i = 1;
     while i < args.len() {
@@ -401,6 +418,8 @@ fn find_command_start(args: &[String]) -> usize {
 
 /// Splits `args[1..end]` into option occurrences. Unknown options are ignored, matching
 /// the C version's `case '?': break;`.
+///
+/// Walks by the same rules as [`find_command_start`]; see the note there.
 fn collect_options(args: &[String], end: usize) -> Result<Vec<Parsed>, String> {
     let mut out = Vec::new();
     let mut i = 1;
@@ -666,7 +685,13 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
     cfg.prefs_json = jsonc::to_string(&serde_json::Value::Object(prefs));
 
     if let Some(base) = base_path {
-        cfg.endpoints = Endpoints::with_base_path(&base);
+        match Endpoints::with_base_path(&base) {
+            Ok(endpoints) => cfg.endpoints = endpoints,
+            Err(message) => {
+                eprintln!("{message}");
+                return Err(255);
+            }
+        }
     }
 
     // Authentication precedence matches the C version: an explicit forward-auth endpoint wins,
@@ -833,6 +858,58 @@ mod tests {
         assert_eq!(cfg.endpoints.index, "/mounted/here/");
         assert_eq!(cfg.endpoints.token, "/mounted/here/token");
         assert_eq!(cfg.endpoints.ws, "/mounted/here/ws");
+    }
+
+    #[test]
+    fn a_base_path_without_a_leading_slash_is_normalized() {
+        // The router rejects a path with no leading slash by panicking, so this must be
+        // handled before it ever gets there.
+        let cfg = run(&["ttyd", "-b", "mounted", "bash"]);
+        assert_eq!(cfg.endpoints.parent, "/mounted");
+        assert_eq!(cfg.endpoints.index, "/mounted/");
+    }
+
+    #[test]
+    fn a_base_path_with_route_syntax_is_rejected() {
+        for bad in ["/a{x}", "/a?b", "/a#b"] {
+            match parse(&argv(&["ttyd", "-b", bad, "bash"])) {
+                Outcome::Exit(code) => assert_eq!(code, 255, "for {bad}"),
+                Outcome::Run(_) => panic!("{bad} should have been rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn command_start_agrees_with_option_parsing() {
+        // find_command_start and collect_options implement the same walking rules twice;
+        // this pins them together so a future option with unusual arity cannot split them.
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["ttyd", "-W", "-p", "8080", "bash"],
+            vec!["ttyd", "-Wa6", "bash", "-c", "x"],
+            vec!["ttyd", "-p7000", "--terminal-type=vt100", "sh"],
+            vec!["ttyd", "-Z", "-W", "bash"],
+            vec!["ttyd", "--", "-weird"],
+            vec!["ttyd", "-t", "a=b", "-c", "u:p", "bash"],
+            vec!["ttyd", "--auth-url", "http://x/y", "bash"],
+        ];
+        for case in cases {
+            let args = argv(&case);
+            let start = find_command_start(&args);
+            // Every argument before the command must be consumed as an option or its value;
+            // nothing in that range may look like the start of the command.
+            assert!(
+                collect_options(&args, start).is_ok(),
+                "option parsing failed for {case:?}"
+            );
+            assert!(start <= args.len(), "start out of range for {case:?}");
+            if start < args.len() {
+                let first = &args[start];
+                assert!(
+                    !first.starts_with('-') || case.contains(&"--"),
+                    "command start {first:?} looks like an option in {case:?}"
+                );
+            }
+        }
     }
 
     #[test]

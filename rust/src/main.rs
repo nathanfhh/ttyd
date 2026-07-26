@@ -113,15 +113,23 @@ async fn watch_signals(state: Arc<AppState>) {
     std::process::exit(0);
 }
 
-/// Waits for open sessions to finish tearing down, capped so a wedged session cannot hold
-/// the process open indefinitely.
+/// Terminates the running terminals and gives them a moment to go away.
+///
+/// The children are signalled here rather than left to each session task: a task that is
+/// not scheduled in time would otherwise leave its terminal running after the server is
+/// gone, and because each child leads its own process group nothing else would reap it.
 async fn wait_for_sessions_to_end(state: &AppState) {
+    let signalled = state.signal_children(state.cfg.sig_code);
+    if signalled > 0 {
+        tracing::info!("signalled {signalled} running terminal(s)");
+    }
+
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while state.client_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     // Give the child processes a beat to actually die after being signalled.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
 
 /// Maps the libwebsockets log-level bitmask that `-d` accepts onto tracing levels.

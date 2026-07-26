@@ -2,8 +2,9 @@
 
 use crate::auth::Authenticator;
 use crate::cli::Config;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 /// Per-connection facts the accept loop records and the handlers read back out of the
@@ -34,6 +35,9 @@ pub struct AppState {
     force_exit: AtomicBool,
     accepting: AtomicBool,
     shutdown: watch::Sender<bool>,
+    /// Process-group leaders of every running child. Shutdown signals these directly rather
+    /// than waiting for each session task to notice, which under load it may not do in time.
+    children: Mutex<HashSet<i32>>,
 }
 
 impl AppState {
@@ -45,6 +49,7 @@ impl AppState {
             force_exit: AtomicBool::new(false),
             accepting: AtomicBool::new(true),
             shutdown: watch::channel(false).0,
+            children: Mutex::new(HashSet::new()),
         })
     }
 
@@ -78,6 +83,34 @@ impl AppState {
     /// Releases a client slot and reports the remaining count.
     pub fn release_client(&self) -> i64 {
         self.client_count.fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    pub fn register_child(&self, pid: i32) {
+        if let Ok(mut children) = self.children.lock() {
+            children.insert(pid);
+        }
+    }
+
+    pub fn unregister_child(&self, pid: i32) {
+        if let Ok(mut children) = self.children.lock() {
+            children.remove(&pid);
+        }
+    }
+
+    /// Signals every registered child's process group. Returns how many were signalled.
+    pub fn signal_children(&self, signal: i32) -> usize {
+        let Ok(children) = self.children.lock() else {
+            return 0;
+        };
+        let mut signalled = 0;
+        for pid in children.iter() {
+            // Safety: signalling a process group by negated pid; a stale pid at worst
+            // returns ESRCH, which is why the result is ignored.
+            if unsafe { libc::kill(-pid, signal) } == 0 {
+                signalled += 1;
+            }
+        }
+        signalled
     }
 
     pub fn set_force_exit(&self) {

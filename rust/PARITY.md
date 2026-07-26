@@ -27,24 +27,24 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 | | Tests | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 80 run against it, all passing | **87.89 %** |
-| Rust port (`rust/src/*.rs`, 2161 lines) | 162 total, all passing | **91.67 %** |
+| C reference (`src/*.c`, 966 lines) | 83 run against it, all passing | **87.89 %** |
+| Rust port (`rust/src/*.rs`, 2454 lines) | 175 total, all passing | **91.32 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 67 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 74 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
 | `ws_parity` | 31 | yes |
 | `tls_parity` | 3 | yes |
-| `lifecycle_parity` | 16 | yes |
-| `forward_auth` | 15 | no — new feature |
+| `lifecycle_parity` | 19 | yes |
+| `forward_auth` | 18 | no — new feature |
 
-76 of the 80 shared tests assert identical behaviour on both binaries. The remaining
-four are the documented divergences below, plus the `--title` test which covers an
-option the C build does not have.
+77 of the 83 shared tests assert identical behaviour on both binaries. The remaining six
+are the documented divergences below plus the tests covering behaviour the C build does not
+have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
 What the remaining ~12 % of uncovered C lines consists of, checked line by line:
 allocation and `lws_write` failure branches, `inflate` failure handling, `fork`/`execvp`
@@ -144,8 +144,26 @@ Beyond the three divergences, the port makes these changes on purpose:
 - **404 responses are byte-identical** to what libwebsockets emits, so anything scraping
   error pages sees no change.
 
+- **Integer options reject trailing garbage and octal literals.** The C version parses them
+  with `strtol(…, 0)`, which accepts `-p 80abc` as port 80 and reads `-p 010` as 8. This port
+  requires the whole value to be a decimal (or `0x`-prefixed) number and exits with the
+  standard `invalid value for …` message otherwise.
+- **`--base-path` is normalized and validated.** A value with no leading slash is accepted
+  and normalized (`mounted` → `/mounted`) rather than reaching the router verbatim, and a
+  value containing `{`, `}`, `?` or `#` is rejected — those are route-matching syntax and
+  would silently turn the endpoints into wildcard captures.
+- **Log timestamps are UTC**, where the C build prints local time. Deliberate: a container
+  with no `TZ` set is UTC anyway, and UTC is easier to correlate across hosts.
+
 Two options are added, and nothing that existed was removed: `--title`, above, and
 `--auth-url` with its companions, documented in [README.md](README.md).
+
+One option maps onto a different mechanism. `--srv-buf-size` configures libwebsockets'
+per-thread service buffer in the C build; there is no equivalent knob in hyper, so this port
+applies it to the closest observable thing — the largest amount of terminal output read from
+the PTY, and therefore carried in a single WebSocket frame. The default stays 4096, matching
+the C default, and `lifecycle_parity::the_send_buffer_size_bounds_one_output_frame` pins the
+behaviour down.
 
 ## Gaps the coverage run exposed
 
@@ -164,6 +182,40 @@ in the port rather than merely missing tests:
 
 Both are covered by tests that pass against the C build too.
 
+## Defects this port shipped and then fixed
+
+Recorded because the reader deserves to know which parts had to be corrected after the
+first implementation landed, and because each one says something about where the testing
+approach above was blind.
+
+- **Forward-auth cache could replay a verdict.** The cache key covered the path and the
+  operator-listed request headers, but the subrequest also carried the method and the
+  `X-Forwarded-*` set — so a grant issued for one request was reused for another the
+  endpoint would have refused, without the endpoint being consulted. Differential testing
+  could not have caught this: forward auth has no counterpart in the C build to differ
+  against. Fixed by deriving the key from the same structure that builds the outgoing
+  headers, so the two cannot drift apart.
+- **Privilege dropping left supplementary groups in place.** `setgid` does not touch that
+  list; libwebsockets calls `initgroups`, and this port did not. A test for `--uid` existed
+  and ran against both builds, but asserted only `id -u` — shallow enough to miss it. Fixed
+  with `initgroups`/`setgroups`, and the test now asserts the whole group list and installs
+  a marker group itself rather than depending on how the machine happens to be configured.
+- **`--url-arg` did not percent-decode.** Written against the assumption that
+  libwebsockets hands over raw fragments; measuring showed it decodes. The test used
+  `first` and `second`, values that look identical either way. Fixed, and the test now uses
+  values containing a space and a non-ASCII character.
+- **`--srv-buf-size` was parsed and never read**, and the WebSocket access log reported
+  every client as `unix` because the handler built a default `ConnInfo` instead of reading
+  the one the accept loop recorded. Both fixed, both now covered.
+- **Shutdown left terminals running under load.** Terminating the server relied on each
+  session task waking up to signal its own child; under parallel load a task could miss the
+  window, and since every child leads its own process group nothing else would reap it. The
+  server now signals the registered children itself before exiting.
+- **The forwarded identity was silently truncated to 29 bytes**, mirroring the C buffer. That
+  is worse than it looks: two accounts sharing a 29-byte prefix would collapse onto the same
+  `TTYD_USER`. The limit is gone — the name is passed through whole. (The C build refuses the
+  WebSocket upgrade outright for such a name, which the suite now asserts on that side.)
+
 ## Known gap
 
 **Windows is not ported.** The C implementation supports Windows through ConPTY
@@ -176,4 +228,6 @@ than shipped untested.
 Everything else in the C feature matrix is implemented and covered: all 30 command-line
 options, the four HTTP endpoints, all eight WebSocket message types, all three
 authentication modes, TLS with client-certificate verification, UNIX domain sockets,
-privilege dropping and the `--once` / `--exit-no-conn` lifecycle rules.
+privilege dropping and the `--once` / `--exit-no-conn` lifecycle rules. Each option has at
+least one test asserting an observable effect, so "implemented" here means exercised rather
+than merely parsed.

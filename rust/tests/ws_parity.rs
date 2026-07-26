@@ -368,13 +368,18 @@ async fn url_arguments_are_appended_to_the_command() {
     // written can lose that output to the C build's abrupt connection teardown, and this
     // test is about argument passing, not shutdown timing.
     let server = Server::start(&["-a", "-W", "sh", "-c", r#"echo "$@"; sleep 3"#, "sh"]);
-    let mut ws = connect_ws(&server.ws_url("/ws?arg=first&arg=second"), &[])
+    // Percent-encoded values are the interesting case: a value that survives whether or not
+    // decoding happens proves nothing, which is how an encoding divergence stayed hidden.
+    let mut ws = connect_ws(&server.ws_url("/ws?arg=hello%20world&arg=second"), &[])
         .await
         .expect("connect");
     open_session(&mut ws, 80, 24).await;
 
-    let seen = read_until(&mut ws, "first second", LONG).await;
-    assert!(seen.contains("first second"), "got {seen:?}");
+    let seen = read_until(&mut ws, "hello world second", LONG).await;
+    assert!(
+        seen.contains("hello world second"),
+        "url arguments were not decoded before reaching the child: {seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -403,13 +408,29 @@ async fn the_authenticated_user_is_exported_as_ttyd_user() {
         "-c",
         "echo USER=$TTYD_USER; sleep 5",
     ]);
-    let mut ws = connect_ws(&server.ws_url("/ws"), &[("X-Remote-User", "alice")])
+    // Deliberately longer than the C build's 29-byte `pss_tty.user` buffer. There
+    // `lws_hdr_custom_copy` refuses a value that does not fit, so such an account cannot open
+    // a terminal at all; this port has no fixed buffer and passes the name through whole.
+    let long_name = "alice-with-a-very-long-account-name";
+    if common::is_c_reference() {
+        assert!(
+            connect_ws(&server.ws_url("/ws"), &[("X-Remote-User", long_name)])
+                .await
+                .is_err(),
+            "the C build is expected to refuse an identity that overflows its buffer"
+        );
+        return;
+    }
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[("X-Remote-User", long_name)])
         .await
         .expect("connect");
     open_session(&mut ws, 80, 24).await;
 
-    let seen = read_until(&mut ws, "USER=alice", LONG).await;
-    assert!(seen.contains("USER=alice"), "got {seen:?}");
+    let seen = read_until(&mut ws, &format!("USER={long_name}"), LONG).await;
+    assert!(
+        seen.contains(&format!("USER={long_name}")),
+        "the identity did not reach the child intact: {seen:?}"
+    );
 }
 
 #[tokio::test]

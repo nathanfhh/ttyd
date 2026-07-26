@@ -28,14 +28,21 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 /// code reflects the real exit status.
 const EXIT_STATUS_GRACE: Duration = Duration::from_secs(2);
 
+/// Terminal size used until the browser reports its own, matching the C `process_init()`.
+const DEFAULT_COLUMNS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
+    conn: Option<Extension<ConnInfo>>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let conn = ConnInfo::default();
+    // The accept loop records the peer; without it the only log line naming who opened a
+    // terminal would report every client as a UNIX socket.
+    let conn = conn.map(|Extension(conn)| conn).unwrap_or_default();
 
     if state.cfg.check_origin && !origin_matches_host(&headers) {
         tracing::warn!(
@@ -125,6 +132,7 @@ async fn session(
         mut output,
         mut exit,
     } = spawned;
+    state.register_child(pty.pid);
     tracing::info!("started process, pid: {}", pty.pid);
 
     let title = state.cfg.window_title();
@@ -140,6 +148,7 @@ async fn session(
             if pty.is_running() {
                 pty.kill(state.cfg.sig_code);
             }
+            state.unregister_child(pty.pid);
             finish(&mut slot, &state, Some(&pty)).await;
             return;
         }
@@ -259,6 +268,7 @@ async fn session(
         tracing::info!("killing process, pid: {}", pty.pid);
         pty.kill(state.cfg.sig_code);
     }
+    state.unregister_child(pty.pid);
 
     finish(&mut slot, &state, Some(&pty)).await;
 }
@@ -357,8 +367,13 @@ fn spawn_child(
         argv: &argv,
         env: &env,
         cwd: state.cfg.cwd.as_deref(),
-        columns: if columns > 0 { columns } else { 80 },
-        rows: if rows > 0 { rows } else { 24 },
+        read_chunk: state.cfg.srv_buf_size,
+        columns: if columns > 0 {
+            columns
+        } else {
+            DEFAULT_COLUMNS
+        },
+        rows: if rows > 0 { rows } else { DEFAULT_ROWS },
     };
 
     match pty::spawn(request) {
@@ -407,6 +422,10 @@ fn handle_client_message(
 }
 
 /// Extracts repeated `arg=` query parameters, preserving their order.
+///
+/// Values are percent-decoded before they reach the child, matching libwebsockets, which
+/// hands the C implementation already-decoded fragments. Passing the raw form through would
+/// silently corrupt any argument containing a space or a reserved character.
 fn parse_url_args(query: Option<&str>) -> Vec<String> {
     let Some(query) = query else {
         return Vec::new();
@@ -414,8 +433,39 @@ fn parse_url_args(query: Option<&str>) -> Vec<String> {
     query
         .split('&')
         .filter_map(|pair| pair.strip_prefix("arg="))
-        .map(|v| v.to_string())
+        .map(decode_query_value)
         .collect()
+}
+
+/// Decodes one query-string value: `+` means a space, `%XX` is a byte escape. Invalid
+/// escapes are left as written rather than dropped, so nothing silently disappears.
+fn decode_query_value(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Compares the `Origin` header against `Host`, the way `--check-origin` does in C.
@@ -484,6 +534,22 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn url_args_are_percent_decoded() {
+        assert_eq!(
+            parse_url_args(Some("arg=hello%20world&arg=a%2Bb&arg=caf%C3%A9")),
+            vec!["hello world", "a+b", "café"]
+        );
+        assert_eq!(parse_url_args(Some("arg=one+two")), vec!["one two"]);
+    }
+
+    #[test]
+    fn a_malformed_escape_is_left_alone() {
+        // Dropping it would silently change the argument; keeping it is the visible failure.
+        assert_eq!(parse_url_args(Some("arg=100%zz")), vec!["100%zz"]);
+        assert_eq!(parse_url_args(Some("arg=trailing%")), vec!["trailing%"]);
     }
 
     #[test]

@@ -10,8 +10,13 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tower::ServiceExt;
+
+/// How long to wait for the first byte when deciding whether a connection on the TLS port
+/// is a handshake or plain HTTP.
+const TLS_SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The listening socket, which is either a TCP port or a UNIX domain socket.
 pub enum Listener {
@@ -219,9 +224,13 @@ async fn serve_tcp(
     // The C build enables both `ALLOW_NON_SSL_ON_SSL_PORT` and `REDIRECT_HTTP_TO_HTTPS`, so a
     // plain HTTP request on the TLS port is answered with a redirect instead of a handshake
     // failure. A TLS ClientHello always starts with the handshake record type, 0x16.
+    // Bounded, because this runs before hyper takes over and therefore before any of its
+    // timeouts apply — a client that connects and then says nothing would otherwise hold
+    // the task and its descriptor open indefinitely.
     let mut first = [0u8; 1];
-    let is_tls = match stream.peek(&mut first).await {
-        Ok(1) => first[0] == 0x16,
+    let peeked = tokio::time::timeout(TLS_SNIFF_TIMEOUT, stream.peek(&mut first)).await;
+    let is_tls = match peeked {
+        Ok(Ok(1)) => first[0] == 0x16,
         _ => return,
     };
 
@@ -288,7 +297,40 @@ fn redirect_router() -> Router {
 }
 
 /// Drops privileges after the socket is bound, matching the order the C version relies on.
+///
+/// Supplementary groups are dealt with first and separately: `setgid` does not touch that
+/// list, so without this the terminal would keep every group the server was started with —
+/// `docker`, `adm`, `disk` and friends when launched from a root session or via systemd's
+/// `SupplementaryGroups=`. libwebsockets calls `initgroups` for the same reason.
 pub fn drop_privileges(cfg: &Config) -> Result<()> {
+    if cfg.uid.is_none() && cfg.gid.is_none() {
+        return Ok(());
+    }
+
+    let target_gid = cfg.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let target_user = cfg
+        .uid
+        .and_then(|uid| nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok())
+        .flatten();
+
+    match target_user {
+        // Rebuild the list from the target user's real group membership, as the C build does.
+        Some(user) => {
+            let name = std::ffi::CString::new(user.name.as_bytes())
+                .context("user name contains an interior NUL")?;
+            if unsafe { libc::initgroups(name.as_ptr(), target_gid) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("initgroups failed");
+            }
+        }
+        // No user to look up, so there is no membership to rebuild — drop the list entirely
+        // rather than leaving the caller's groups in place.
+        None => {
+            if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("setgroups failed");
+            }
+        }
+    }
+
     if let Some(gid) = cfg.gid {
         if unsafe { libc::setgid(gid) } != 0 {
             return Err(std::io::Error::last_os_error()).context("setgid failed");

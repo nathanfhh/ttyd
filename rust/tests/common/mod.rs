@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,12 +44,35 @@ impl Server {
         Self::start_with_env(args, &[])
     }
 
+    /// Starts ttyd holding the given supplementary groups, so a test can prove they are
+    /// dropped. Requires root; the group ids need not exist in `/etc/group`.
+    pub fn start_with_supplementary_groups(args: &[&str], groups: &[u32]) -> Server {
+        let groups = groups.to_vec();
+        Self::start_inner(args, &[], Some(groups))
+    }
+
     pub fn start_with_env(args: &[&str], env: &[(&str, &str)]) -> Server {
+        Self::start_inner(args, env, None)
+    }
+
+    fn start_inner(args: &[&str], env: &[(&str, &str)], groups: Option<Vec<u32>>) -> Server {
         let mut command = Command::new(binary());
         command.arg("-p").arg("0");
         command.args(args);
         for (key, value) in env {
             command.env(key, value);
+        }
+        if let Some(groups) = groups {
+            // Safety: `setgroups` is async-signal-safe and the vector outlives the call.
+            unsafe {
+                command.pre_exec(move || {
+                    let ids: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
+                    if libc::setgroups(ids.len(), ids.as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         command
             .stdout(Stdio::piped())

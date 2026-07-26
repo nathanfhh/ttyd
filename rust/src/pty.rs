@@ -12,11 +12,13 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-/// Size of a single read from the PTY master, matching libuv's suggested buffer size.
-const READ_CHUNK: usize = 65536;
+/// Size of a single read from the PTY master when `--srv-buf-size` is not set, matching
+/// libuv's suggested buffer size.
+pub const DEFAULT_READ_CHUNK: usize = 65536;
 
 /// How the child process finished, with the same numbers the C version derives from `waitpid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,9 @@ impl ExitInfo {
 /// Everything a session needs to drive one child process.
 pub struct Pty {
     pub pid: i32,
+    /// Set once the child has been reaped. After that the pid may be handed to an unrelated
+    /// process, so signalling it would hit a stranger's process group.
+    reaped: Arc<AtomicBool>,
     master: Arc<OwnedFd>,
     writer: mpsc::UnboundedSender<Vec<u8>>,
     pub columns: u16,
@@ -56,6 +61,8 @@ pub struct SpawnRequest<'a> {
     pub cwd: Option<&'a Path>,
     pub columns: u16,
     pub rows: u16,
+    /// Largest amount of terminal output read — and therefore sent — at once.
+    pub read_chunk: usize,
 }
 
 pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
@@ -116,13 +123,15 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
     let (exit_tx, exit_rx) = oneshot::channel::<ExitInfo>();
     let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    spawn_reader(dup_as_file(&master)?, out_tx);
+    spawn_reader(dup_as_file(&master)?, out_tx, req.read_chunk.max(1));
     spawn_writer(dup_as_file(&master)?, write_rx);
-    spawn_reaper(child, exit_tx);
+    let reaped = Arc::new(AtomicBool::new(false));
+    spawn_reaper(child, exit_tx, reaped.clone());
 
     Ok(Spawned {
         pty: Pty {
             pid,
+            reaped,
             master,
             writer: write_tx,
             columns: req.columns,
@@ -158,14 +167,16 @@ impl Pty {
 
     /// Signals the child's entire process group, matching the C `uv_kill(-pid, sig)`.
     pub fn kill(&self, signal: i32) -> bool {
-        if self.pid <= 0 {
+        if self.pid <= 0 || self.reaped.load(Ordering::SeqCst) {
             return false;
         }
         unsafe { libc::kill(-self.pid, signal) == 0 }
     }
 
     pub fn is_running(&self) -> bool {
-        self.pid > 0 && unsafe { libc::kill(self.pid, 0) } == 0
+        self.pid > 0
+            && !self.reaped.load(Ordering::SeqCst)
+            && unsafe { libc::kill(self.pid, 0) } == 0
     }
 }
 
@@ -186,9 +197,9 @@ fn dup_as_file(master: &Arc<OwnedFd>) -> Result<std::fs::File> {
     Ok(std::fs::File::from(dup))
 }
 
-fn spawn_reader(mut file: std::fs::File, tx: mpsc::Sender<Vec<u8>>) {
+fn spawn_reader(mut file: std::fs::File, tx: mpsc::Sender<Vec<u8>>, chunk: usize) {
     std::thread::spawn(move || {
-        let mut buf = vec![0u8; READ_CHUNK];
+        let mut buf = vec![0u8; chunk];
         loop {
             match file.read(&mut buf) {
                 Ok(0) => break,
@@ -218,7 +229,7 @@ fn spawn_writer(mut file: std::fs::File, mut rx: mpsc::UnboundedReceiver<Vec<u8>
     });
 }
 
-fn spawn_reaper(mut child: Child, tx: oneshot::Sender<ExitInfo>) {
+fn spawn_reaper(mut child: Child, tx: oneshot::Sender<ExitInfo>, reaped: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let info = match child.wait() {
             Ok(status) => match status.signal() {
@@ -236,6 +247,9 @@ fn spawn_reaper(mut child: Child, tx: oneshot::Sender<ExitInfo>) {
                 signal: None,
             },
         };
+        // Flag before publishing the status: once waitpid has returned, the pid is free for
+        // reuse and must never be signalled again.
+        reaped.store(true, Ordering::SeqCst);
         let _ = tx.send(info);
     });
 }
@@ -252,6 +266,7 @@ mod tests {
             cwd: None,
             columns: 80,
             rows: 24,
+            read_chunk: DEFAULT_READ_CHUNK,
         }
     }
 
