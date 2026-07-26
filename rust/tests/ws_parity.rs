@@ -53,6 +53,24 @@ async fn open_session(ws: &mut WsStream, columns: u16, rows: u16) -> (String, St
     read_handshake(ws).await
 }
 
+/// Waits for a marker file to have content, not merely to exist.
+///
+/// `echo x > file` creates the directory entry and writes to it as separate syscalls, so a
+/// loop that only checks `exists()` can read the empty file in between and assert against a
+/// truncated string. Guarding on length is what `e2e-soak.py` already does.
+async fn wait_for_content(path: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 #[tokio::test]
 async fn nothing_is_sent_before_the_opening_frame() {
     // The title carries the full command line, so a client that has not identified itself
@@ -196,11 +214,7 @@ async fn input_arriving_as_a_text_frame_is_handled_too() {
         .await
         .expect("send text frame");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !marker.exists() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    let seen = wait_for_content(&marker).await;
     assert!(
         seen.contains("TEXT-FRAME-OK"),
         "a text frame did not reach the terminal, got {seen:?}"
@@ -228,11 +242,7 @@ async fn a_ping_from_the_client_does_not_disturb_the_session() {
         .await
         .expect("send input");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !marker.exists() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    let seen = wait_for_content(&marker).await;
     assert!(
         seen.contains("STILL-ALIVE"),
         "the session stopped working after a client ping, got {seen:?}"

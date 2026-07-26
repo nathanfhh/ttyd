@@ -406,22 +406,23 @@ fresh directory per run.
 Both builds are Release: the C build at `-O3 -DNDEBUG`, this one with LTO, one codegen unit
 and symbols stripped. Runs are interleaved — C, Rust, C, Rust — rather than grouped, so
 machine drift lands on both instead of on whichever went second. Each figure is the median of
-five rounds, and the per-round spread is given because a difference smaller than the noise is
-not a difference.
+five rounds on an otherwise idle 4-core machine, and the full per-round range is shown for
+every row, because a difference smaller than the spread is not a difference.
 
-| Measurement | C | Rust | |
-|---|---|---|---|
-| startup to listening (ms) | 4.1 | **2.9** | spreads do not overlap |
-| baseline RSS (kB) | 5016 | 5184 | equal in practice |
-| **RSS per idle session (kB)** | **17.1** | 202.1 | **C wins, 12×** |
-| HTTP `/token` (req/s) | 3848 | **4284** | client-bound; a floor, not a ceiling |
-| terminal sessions (open+close/s) | 297 | **699** | C 270–330, Rust 394–805 |
-| terminal output (MB/s) | 59.1 | **79.4** | C 55.6–59.6, Rust 73.3–80.3 |
-| CPU per MB delivered (ms) | 12.2 | 11.9 | spreads overlap — equal |
+| Measurement | C (median) | C range | Rust (median) | Rust range | Verdict |
+|---|---|---|---|---|---|
+| startup to listening (ms) | 4.2 | 3.8–5.5 | **2.8** | 2.6–3.0 | Rust, ranges disjoint |
+| baseline RSS (kB) | 5048 | 5028–5052 | 5276 | 5092–5300 | C, but by 4 % |
+| **RSS per idle session (kB)** | **17.3** | 17.1–17.3 | 204.8 | 204.0–209.9 | **C, 12×** |
+| HTTP `/token` (req/s) | 3546 | 3243–4028 | 4621 | 3780–4693 | ranges overlap — no call |
+| terminal sessions (open+close/s) | 321 | 290–370 | **660** | 425–824 | Rust, ranges disjoint |
+| terminal output (MB/s) | 63.1 | 56.6–64.7 | **75.6** | 73.6–82.9 | Rust, ranges disjoint |
+| CPU per MB delivered (ms) | 12.2 | 11.2–12.8 | 11.8 | 10.7–12.4 | ranges overlap — equal |
 
-The request-rate figures are produced by a Python client that is itself the bottleneck, so
-they are floors rather than measurements of the server's ceiling. The memory, CPU-per-byte
-and startup figures are read from `/proc` on the server and are not client-bound.
+Two rows deliberately draw no conclusion. The request-rate figure is produced by a Python
+client that is itself the bottleneck, and its ranges overlap besides; CPU per byte is a real
+measurement read from `/proc`, and it is genuinely a tie. Only the four rows with disjoint
+ranges support a claim.
 
 An earlier revision of this table read very differently: throughput was within the noise and
 the C build used 23 % less CPU per byte delivered. That was measured before the PTY stopped
@@ -430,7 +431,12 @@ entry below) did not only reduce memory; it moved throughput and CPU efficiency 
 ahead" to "Rust is ahead or equal", because three threads per session multiplied by the
 client count was scheduler pressure rather than useful work.
 
-**Where C still wins is memory per session, decisively**: 17 kB against 202 kB. At
+A methodology note, recorded because it nearly went unnoticed: the first run of this table
+was taken while an eight-minute browser soak was running on the same machine. The numbers
+happened to survive a clean re-run, but they should not have been reported. These figures
+come from a run with nothing else scheduled.
+
+**Where C wins is memory per session, decisively**: 17 kB against 205 kB. At
 `--max-clients 100` that is 1.7 MB against 20 MB. Decomposed by connection stage:
 
 | | RSS per connection |

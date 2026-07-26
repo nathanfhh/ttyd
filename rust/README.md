@@ -155,9 +155,11 @@ which *is* committed, so any revision can reproduce its own SBOM exactly — whe
 copy silently goes stale on the next dependency bump, and a stale SBOM is worse than none
 because it is trusted. Generate it in CI, at release time, or on demand.
 
-As of the last run: 222 crates locked from 24 direct dependencies, **no known
-vulnerabilities**, and one informational warning — `rustls-pemfile` is unmaintained
-(RUSTSEC-2025-0134). It parses the PEM files named by `--ssl-cert`, `--ssl-key` and
+Run on 2026-07-26 UTC against 1169 RustSec advisories: 222 crates locked from 24 direct
+dependencies, **no known vulnerabilities then**, and one informational warning — `rustls-pemfile` is unmaintained
+(RUSTSEC-2025-0134). Re-run the command above rather than trusting this paragraph — a
+vulnerability-free result is a statement about a date, not a property of the code. It parses
+the PEM files named by `--ssl-cert`, `--ssl-key` and
 `--ssl-ca`, which are operator-supplied local files rather than network input.
 
 ## Compatibility
