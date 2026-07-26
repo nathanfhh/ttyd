@@ -125,6 +125,34 @@ async fn a_custom_index_replaces_the_bundle() {
 }
 
 #[tokio::test]
+async fn a_custom_index_that_disappears_is_a_server_error() {
+    // `-I` is checked at startup, but the file is read per request, so it can vanish while
+    // the server is running — a deploy replacing the directory, for instance. That must be a
+    // 500 rather than a panic or an empty 200 that looks like a working but blank terminal.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.html");
+    std::fs::write(&path, "<html>temporary</html>").expect("write");
+
+    let server = Server::start(&["-I", path.to_str().unwrap(), "bash"]);
+    let ok = http_client()
+        .get(server.http_url("/"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    std::fs::remove_file(&path).expect("remove the index out from under the server");
+    let gone = http_client()
+        .get(server.http_url("/"))
+        .send()
+        .await
+        .expect("request");
+    // 404, matching the C build: `lws_serve_http_file` cannot tell a file that was never
+    // there from one a deploy has just replaced, and neither can this.
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn the_token_endpoint_is_empty_without_a_credential() {
     let server = Server::start(&["bash"]);
     let response = http_client()

@@ -31,8 +31,6 @@ pub struct AppState {
     pub auth: Arc<Authenticator>,
     client_count: AtomicI64,
     /// Set once the server has decided to exit but is waiting for a child process to die,
-    /// mirroring the C `force_exit` flag.
-    force_exit: AtomicBool,
     accepting: AtomicBool,
     shutdown: watch::Sender<bool>,
     /// Process-group leaders of every running child. Shutdown signals these directly rather
@@ -46,7 +44,6 @@ impl AppState {
             cfg,
             auth,
             client_count: AtomicI64::new(0),
-            force_exit: AtomicBool::new(false),
             accepting: AtomicBool::new(true),
             shutdown: watch::channel(false).0,
             children: Mutex::new(HashSet::new()),
@@ -111,14 +108,6 @@ impl AppState {
             }
         }
         signalled
-    }
-
-    pub fn set_force_exit(&self) {
-        self.force_exit.store(true, Ordering::SeqCst);
-    }
-
-    pub fn force_exit(&self) -> bool {
-        self.force_exit.load(Ordering::SeqCst)
     }
 
     pub fn is_accepting(&self) -> bool {

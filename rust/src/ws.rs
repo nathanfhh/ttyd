@@ -315,7 +315,6 @@ async fn finish(slot: &mut ClientSlot, state: &Arc<AppState>, pty: Option<&pty::
 
     if pty.is_some_and(|p| p.is_running()) {
         // Wait for the child to actually die before tearing the process down.
-        state.set_force_exit();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             if !pty.is_some_and(|p| p.is_running()) {

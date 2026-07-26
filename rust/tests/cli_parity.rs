@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::{is_c_reference, run_cli};
+use std::time::Duration;
+
+use common::{is_c_reference, run_cli, Server};
 
 #[test]
 fn version_goes_to_stdout() {
@@ -147,6 +149,73 @@ fn a_malformed_auth_method_is_rejected_at_startup() {
         "stderr was {:?}",
         result.stderr
     );
+}
+
+#[test]
+fn an_option_missing_its_argument_is_reported() {
+    // getopt_long's own diagnostics, reproduced: the long form names the option with two
+    // dashes, the short form with one.
+    // The option must be last, or the next word is taken as its argument.
+    let long = run_cli(&["--credential"]);
+    assert_eq!(long.code, 255);
+    assert!(
+        long.stderr.contains("requires an argument"),
+        "stderr was {:?}",
+        long.stderr
+    );
+
+    let short = run_cli(&["-c"]);
+    assert_eq!(short.code, 255);
+    assert!(
+        short.stderr.contains("requires an argument"),
+        "stderr was {:?}",
+        short.stderr
+    );
+}
+
+#[tokio::test]
+async fn an_unrecognized_option_is_reported_but_not_fatal() {
+    // Surprising, and worth pinning precisely because it is: `getopt_long` prints the
+    // diagnostic and returns `?`, which the C build does not treat as an error — it carries
+    // on and serves. Verified against the C binary, which does the same. Anyone expecting a
+    // typo'd flag to stop the server is wrong about both builds.
+    let mut server = Server::start(&["--no-such-option", "bash"]);
+    let response = common::http_client()
+        .get(server.http_url("/token"))
+        .send()
+        .await
+        .expect("the server should still be serving");
+    assert_eq!(response.status(), 200);
+    assert!(
+        server.wait_for_log("unrecognized option", Duration::from_secs(5)),
+        "the option should still have been reported"
+    );
+}
+
+#[test]
+fn out_of_range_option_values_are_rejected() {
+    // Each of these has its own message in the C build, and each is a separate branch here.
+    for (args, needle) in [
+        (vec!["-P", "-1", "bash"], "invalid ping interval"),
+        (vec!["-f", "-1", "bash"], "invalid srv-buf-size"),
+        (vec!["-t", "novalue", "bash"], "invalid client option"),
+    ] {
+        let result = run_cli(&args);
+        assert_eq!(result.code, 255, "{args:?} was accepted");
+        assert!(
+            result.stderr.contains(needle),
+            "{args:?}: stderr was {:?}",
+            result.stderr
+        );
+    }
+}
+
+#[test]
+fn a_hexadecimal_integer_is_accepted() {
+    // The C build parses integer options with `strtol(…, 0)`, which reads an `0x` prefix as
+    // hex. This port keeps that while rejecting the octal and trailing-garbage forms.
+    let server = common::Server::start(&["-f", "0x2000", "bash"]);
+    assert!(server.port > 0, "the server should have started");
 }
 
 #[test]

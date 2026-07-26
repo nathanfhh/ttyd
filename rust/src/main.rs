@@ -101,7 +101,6 @@ async fn watch_signals(state: Arc<AppState>) {
         _ = terminate.recv() => "SIGTERM",
     };
     tracing::info!("received signal: {name}, exiting...");
-    state.set_force_exit();
     state.begin_shutdown();
     tracing::info!("send ^C to force exit.");
 

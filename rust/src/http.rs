@@ -108,8 +108,12 @@ async fn index(State(state): State<Arc<AppState>>, request: Request) -> Response
         return match tokio::fs::read(path).await {
             Ok(body) => html_response(body, false),
             Err(e) => {
+                // The C build answers 404 here — `lws_serve_http_file` cannot distinguish a
+                // file that was never there from one that has just been replaced by a deploy.
+                // The reason is logged so an operator can tell a permission problem from a
+                // missing file, which the status code alone does not say.
                 tracing::error!("cannot read custom index {}: {e}", path.display());
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                not_found(request).await
             }
         };
     }

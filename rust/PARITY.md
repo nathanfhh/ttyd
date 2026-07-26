@@ -27,21 +27,21 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 Coverage is reported against three explicitly different denominators, because a single
 number invites a comparison the method does not support. The first two rows are the
-like-for-like pair: the same 97 shared tests, run against each build.
+like-for-like pair: the same 108 shared tests, run against each build.
 
 | Measured | Scope | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | the 97 shared parity tests | **88.72 %** |
-| Rust port (`rust/src/*.rs`, 1950 lines reached) | the same 97 shared parity tests | **78.56 %** |
-| Rust port, excluding `auth.rs` (1756 lines) | the same 97 shared parity tests | **84.28 %** |
-| Rust port (2760 lines) | all 208 tests, including unit and forward-auth | **92.9 %** |
+| C reference (`src/*.c`, 966 lines) | the 108 shared parity tests | **88.72 %** |
+| Rust port (`rust/src/*.rs`) | the same 108 shared parity tests | **80.58 %** |
+| Rust port, excluding `auth.rs` | the same 108 shared parity tests | **86.55 %** |
+| Rust port (2778 lines) | all 221 tests, including unit and forward-auth | **93.82 %** |
 
 The comparable pair is the first two rows, and it does not favour this port: the shared
 suite reaches **less** of the Rust code than of the C code. Most of that gap is
-`auth.rs` at 26.80 %, which is forward authentication — a feature the C build does not
+`auth.rs`, which is forward authentication — a feature the C build does not
 have, so no shared test can reach it by construction; it is covered instead by the 19
 `forward_auth` tests, which have nothing to run against. Excluding it closes the gap to
-about four points. The rest is that this port carries roughly twice the code of the
+about two points. The rest is that this port carries roughly twice the code of the
 original, some of it error handling with no C equivalent.
 
 The last row is the number to use when asking "how much of this port is tested at all",
@@ -51,22 +51,22 @@ Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 92 | no — internal APIs |
-| `cli_parity` | 14 | yes |
-| `http_parity` | 20 | yes |
-| `ws_parity` | 33 | yes |
+| Unit tests (`cargo test --lib`) | 94 | no — internal APIs |
+| `cli_parity` | 18 | yes |
+| `http_parity` | 21 | yes |
+| `ws_parity` | 37 | yes |
 | `tls_parity` | 4 | yes |
-| `lifecycle_parity` | 26 | yes |
+| `lifecycle_parity` | 28 | yes |
 | `forward_auth` | 19 | no — new feature |
 
-89 of the 97 shared tests assert identical behaviour on both binaries. The remaining eight
+99 of the 108 shared tests assert identical behaviour on both binaries. The remaining nine
 are the documented divergences below plus the tests covering behaviour the C build does not
 have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
 
 What the remaining ~12 % of uncovered C lines consists of, checked line by line:
 allocation and `lws_write` failure branches, `inflate` failure handling, `fork`/`execvp`
 failure paths, the `SIGABRT` handler, the partial-HTTP-write path that needs an
-artificially slow client, and code made unreachable by the two C defects described below.
+artificially slow client, and code made unreachable by the C defects described below.
 None of it is behaviour a black-box test can drive without fault injection.
 
 One caveat on the measurement: the `-u`/`-g` privilege-dropping test does exercise those
@@ -75,7 +75,7 @@ to `nobody`, so that run contributes nothing to the coverage number.
 
 ## Divergences found
 
-Running the suite against both binaries surfaced three real differences. All three were
+Running the suite against both binaries surfaced four real differences. All four were
 resolved in favour of the Rust behaviour, for the reasons given.
 
 ### 1. The server used to announce itself before the client did
@@ -134,6 +134,25 @@ way to ask the server to slow down.
 output travels through a bounded channel, so a paused or slow client stalls the reader
 thread and the kernel PTY buffer applies backpressure to the child process. The test is
 skipped against the C reference, with the reason recorded at the assertion.
+
+### 4. `--socket-owner` without a group silently unprotects the socket
+
+**Found by:** `lifecycle_parity::a_socket_owner_without_a_group_sets_only_the_user`, while
+adding coverage for the short form of the option.
+
+`-U daemon:daemon` works in the C build: the socket ends up `srw-rw---- 1 1`. `-U daemon`,
+with the group half left off, produces `srwxr-xr-x 0 0` — libwebsockets fails to parse the
+string and then abandons the whole permission step, so neither the `chown` nor the
+unconditional `chmod 0660` happens. The socket is left at the process umask.
+
+That is the dangerous direction for a typo to fail in. An operator who writes `-U ttyd`
+instead of `-U ttyd:ttyd` gets a server that starts normally, logs nothing unusual, and
+leaves a world-connectable terminal socket — the opposite of what reaching for a UNIX socket
+was meant to achieve.
+
+**Resolution: the port applies the user half and still enforces the mode.** A missing group
+means "do not change the group", not "do nothing". The test is skipped against the C
+reference, with the reason recorded at the assertion.
 
 ## Other observations about the C build
 
@@ -244,6 +263,12 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **A `force_exit` flag was carried over but never read.** The C build checks it in two
+  places — a second signal escalates to an immediate exit, and a finished child ends the
+  process. Both behaviours exist in this port, implemented by other means (a `select!` on a
+  second signal, and an explicit wait), so setting the flag did nothing. Vestigial state that
+  mirrors a real mechanism is worse than no state at all: it reads as though the behaviour
+  hangs off it. Removed.
 - **An oversized `--srv-buf-size` killed the server on the first connection.** The value is
   allocated once per session, and nothing bounded it: `-f 9999999999999` started cleanly and
   then died the moment a client connected. The C build survives the same argument (its RSS

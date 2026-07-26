@@ -10,7 +10,9 @@ use common::{
     connect_ws, drain_until_close, next_data_frame, open_terminal, read_until, send_command,
     Ending, Server, WsStream,
 };
+use futures_util::SinkExt;
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
 
 const SHORT: Duration = Duration::from_secs(5);
 const LONG: Duration = Duration::from_secs(15);
@@ -178,6 +180,66 @@ async fn input_is_written_to_the_terminal_when_writable() {
 }
 
 #[tokio::test]
+async fn input_arriving_as_a_text_frame_is_handled_too() {
+    // The frontend sends binary, so nothing in the suite had ever sent a text frame — but
+    // both builds accept one, and an intermediary that transcodes frames would produce them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("via-text");
+    let server = Server::start(&["-W", "bash"]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws, 80, 24).await;
+
+    let command = format!("0echo TEXT-FRAME-OK > {}\n", marker.display());
+    ws.send(Message::Text(command.as_str().into()))
+        .await
+        .expect("send text frame");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        seen.contains("TEXT-FRAME-OK"),
+        "a text frame did not reach the terminal, got {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_ping_from_the_client_does_not_disturb_the_session() {
+    // Control frames the server has no use for must be ignored rather than treated as input
+    // or as a reason to hang up. Browsers do not send these, but proxies and health checks do.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("after-ping");
+    let server = Server::start(&["-W", "bash"]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws, 80, 24).await;
+
+    ws.send(Message::Ping(Vec::new())).await.expect("send ping");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The session must still work afterwards, which is the whole point.
+    let command = format!("0echo STILL-ALIVE > {}\n", marker.display());
+    ws.send(Message::Binary(command.into_bytes()))
+        .await
+        .expect("send input");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let seen = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        seen.contains("STILL-ALIVE"),
+        "the session stopped working after a client ping, got {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn input_is_dropped_in_readonly_mode() {
     // Without -W the terminal is read-only, so `cat` must never echo what we send.
     let server = Server::start(&["cat"]);
@@ -206,6 +268,49 @@ async fn the_opening_frame_sets_the_initial_window_size() {
 
     let seen = read_until(&mut ws, "43 132", LONG).await;
     assert!(seen.contains("43 132"), "expected '43 132', got {seen:?}");
+}
+
+#[tokio::test]
+async fn a_zero_sized_opening_frame_falls_back_to_the_default_size() {
+    // `process_init()` in the C build starts at 80x24, and a browser that has not measured
+    // itself yet sends zeros. Falling through to a 0x0 terminal would make every full-screen
+    // program misbehave.
+    let server = Server::start(&["-W", "bash"]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws, 0, 0).await;
+
+    send_command(&mut ws, INPUT, b"stty size\n")
+        .await
+        .expect("send input");
+    let seen = read_until(&mut ws, "24 80", LONG).await;
+    assert!(
+        seen.contains("24 80"),
+        "expected the 80x24 default, got {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_json_frame_mid_session_is_accepted() {
+    // The opening frame is JSON; nothing stops a client sending another one later, and both
+    // builds ignore it rather than treating it as input or as a protocol error.
+    let server = Server::start(&["-W", "cat"]);
+    let mut ws = connect_ws(&server.ws_url("/ws"), &[])
+        .await
+        .expect("connect");
+    open_session(&mut ws, 80, 24).await;
+
+    ws.send(Message::Binary(br#"{"columns":100,"rows":40}"#.to_vec()))
+        .await
+        .expect("send a second json frame");
+
+    // The session must still carry input afterwards.
+    send_command(&mut ws, INPUT, b"still-here\n")
+        .await
+        .expect("send input");
+    let seen = read_until(&mut ws, "still-here", LONG).await;
+    assert!(seen.contains("still-here"), "got {seen:?}");
 }
 
 #[tokio::test]

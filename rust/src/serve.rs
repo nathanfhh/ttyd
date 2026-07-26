@@ -469,6 +469,39 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_without_ipv6_is_an_error_not_a_silent_v4_fallback() {
+        // The bug this guards: the v6 branch used to fall through into the v4 branch, and an
+        // interface's v4 address is normally enumerated first — so `-6 -i lo` bound
+        // 127.0.0.1 and silently ignored `-6`. Answering with an error is the only safe
+        // outcome; quietly binding the wrong family is how a service ends up reachable on an
+        // address the operator did not ask for.
+        let result = resolve_bind_address(&cfg(|c| {
+            c.ipv6 = true;
+            c.iface = Some("lo".into());
+        }));
+        match result {
+            Ok(address) => panic!("-6 -i lo resolved to {address}, ignoring -6"),
+            Err(e) => assert!(
+                e.to_string().contains("no IPv6 address"),
+                "unhelpful error: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_accept_pauses_before_retrying() {
+        // Without the pause, a persistent accept failure (EMFILE is the usual one) spins a
+        // core and starves the runtime that would otherwise be closing the connections which
+        // free those descriptors.
+        let started = tokio::time::Instant::now();
+        accept_backoff(std::io::Error::from_raw_os_error(libc::EMFILE)).await;
+        assert!(
+            started.elapsed() >= ACCEPT_ERROR_BACKOFF,
+            "accept_backoff returned immediately, so the loop would busy-spin"
+        );
+    }
+
+    #[test]
     fn an_unknown_interface_is_an_error_rather_than_a_silent_wildcard() {
         let result = resolve_bind_address(&cfg(|c| c.iface = Some("nosuchdev0".into())));
         assert!(

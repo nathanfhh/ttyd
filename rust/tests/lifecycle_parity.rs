@@ -622,6 +622,11 @@ async fn the_server_pings_idle_sessions() {
 async fn socket_metadata(extra: &[&str]) -> (u32, u32, u32) {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("owned.sock");
+    socket_metadata_at(&socket, extra).await
+}
+
+/// As above, but for a caller that needs to prepare the path first.
+async fn socket_metadata_at(socket: &std::path::Path, extra: &[&str]) -> (u32, u32, u32) {
     let mut args = vec!["-i", socket.to_str().unwrap()];
     args.extend_from_slice(extra);
     args.push("bash");
@@ -643,7 +648,7 @@ async fn socket_metadata(extra: &[&str]) -> (u32, u32, u32) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(&socket).expect("stat socket");
+    let meta = std::fs::metadata(socket).expect("stat socket");
     let result = (meta.uid(), meta.gid(), meta.mode() & 0o777);
 
     unsafe {
@@ -651,6 +656,47 @@ async fn socket_metadata(extra: &[&str]) -> (u32, u32, u32) {
     }
     let _ = child.wait();
     result
+}
+
+#[tokio::test]
+async fn a_socket_left_by_an_unclean_shutdown_is_replaced() {
+    // A server killed with SIGKILL leaves its socket file behind, and `bind` then fails with
+    // EADDRINUSE. Without this the service cannot restart after a crash without manual
+    // cleanup — which is exactly when nobody is around to do it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("stale.sock");
+    std::fs::write(&socket, b"not really a socket").expect("write a stale file");
+    assert!(socket.exists());
+
+    let (uid, _, mode) = socket_metadata_at(&socket, &[]).await;
+    let _ = uid;
+    assert_eq!(
+        mode, 0o660,
+        "the replacement socket must still be restricted"
+    );
+}
+
+#[tokio::test]
+async fn a_socket_owner_without_a_group_sets_only_the_user() {
+    // `-U user` without a group. The C build does not merely ignore the group half — it
+    // abandons the whole permission step, leaving the socket at the process umask (0755,
+    // world-connectable) with no chown either. A missing `:group` therefore silently removes
+    // the protection that using a UNIX socket was meant to provide. Recorded in PARITY.md;
+    // skipped against C, which cannot pass by construction.
+    if common::is_c_reference() {
+        return;
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let before = unsafe { libc::getgid() };
+    let (uid, gid, mode) = socket_metadata(&["-U", "daemon"]).await;
+    assert_eq!(uid, 1, "the user half must still be applied");
+    assert_eq!(
+        gid, before,
+        "no group was named, so the group must not change"
+    );
+    assert_eq!(mode, 0o660);
 }
 
 #[tokio::test]
