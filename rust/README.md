@@ -143,6 +143,23 @@ server's descriptors or threads grow. Because every probe records the shell's ow
 silent reconnect — which looks identical on screen, since the frontend reconnects by itself —
 shows up as a changed PID rather than passing unnoticed.
 
+## Supply chain
+
+```sh
+cargo audit                                    # RustSec advisories against Cargo.lock
+cargo cyclonedx --format json --spec-version 1.5   # writes ttyd.cdx.json
+```
+
+The SBOM is generated rather than checked in. It is derived entirely from `Cargo.lock`,
+which *is* committed, so any revision can reproduce its own SBOM exactly — whereas a stored
+copy silently goes stale on the next dependency bump, and a stale SBOM is worse than none
+because it is trusted. Generate it in CI, at release time, or on demand.
+
+As of the last run: 222 crates locked from 24 direct dependencies, **no known
+vulnerabilities**, and one informational warning — `rustls-pemfile` is unmaintained
+(RUSTSEC-2025-0134). It parses the PEM files named by `--ssl-cert`, `--ssl-key` and
+`--ssl-ca`, which are operator-supplied local files rather than network input.
+
 ## Compatibility
 
 Every command-line option, HTTP endpoint, WebSocket message type and authentication mode of
