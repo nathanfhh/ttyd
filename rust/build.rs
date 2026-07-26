@@ -48,7 +48,26 @@ fn emit_version() {
         None => base,
     };
     println!("cargo:rustc-env=TTYD_VERSION={version}");
-    println!("cargo:rerun-if-changed=../.git/HEAD");
+
+    // `.git/HEAD` only changes when the *branch* changes — committing on the same branch
+    // rewrites `.git/refs/heads/<branch>` instead. Watching HEAD alone leaves the version
+    // stamp frozen at whatever commit the binary was first built from, which is worse than
+    // having no stamp: it misidentifies a deployed binary.
+    let git_dir = PathBuf::from("../.git");
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(reference) = head.strip_prefix("ref:") {
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join(reference.trim()).display()
+            );
+        }
+    }
+    // A ref that lives in `packed-refs` has no loose file to watch.
+    println!(
+        "cargo:rerun-if-changed={}",
+        git_dir.join("packed-refs").display()
+    );
 }
 
 fn parse_header(path: &Path) -> (Vec<u8>, usize) {

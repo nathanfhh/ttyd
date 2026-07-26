@@ -109,6 +109,19 @@ cargo test                                  # everything, against this build
 ./run-parity-tests.sh /path/to/c/ttyd       # and again against the C build, compared
 ```
 
+Those suites drive the protocol with a synthetic client, which proves the wire format but
+not that the shipped frontend works against it. `browser-check.py` closes that gap: it opens
+the page in a real Chromium through Playwright and checks that xterm.js mounts, keystrokes
+reach the shell, `TERM` and window resizes arrive, a full-screen program (`vi`) round-trips,
+and the session never drops. It also leaves screenshots behind for a look at colour, CJK and
+box-drawing output.
+
+```sh
+pip install playwright
+python3 browser-check.py                          # this build
+python3 browser-check.py /path/to/c/ttyd c        # and the C build, for comparison
+```
+
 ## Compatibility
 
 Every command-line option, HTTP endpoint, WebSocket message type and authentication mode of
