@@ -2,18 +2,27 @@
 //!
 //! This mirrors the Unix half of the C `src/pty.c`: a pseudo terminal is opened, the child
 //! becomes a session leader with the slave as its controlling terminal, and the master end is
-//! pumped by dedicated threads. Output flows through a bounded channel, so a slow WebSocket
-//! client stops the reader thread and the kernel PTY buffer applies backpressure to the child —
-//! the same effect the C version achieves with libuv's explicit read pause/resume.
+//! pumped by two tasks driven by readiness on a non-blocking descriptor.
+//!
+//! Nothing here spawns an OS thread. An earlier version used three per session — a reader, a
+//! writer and a reaper — which cost about 234 kB of resident memory each session against the
+//! C build's 17 kB, measured; `--max-clients` multiplies that. Readiness-driven tasks are
+//! heap-sized rather than stack-sized, and `tokio::process` reaps through the runtime's own
+//! SIGCHLD handling rather than a thread per child.
+//!
+//! Output flows through a bounded channel, so a slow WebSocket client stalls the reader task
+//! and the kernel PTY buffer applies backpressure to the child — the same effect the C
+//! version achieves with libuv's explicit read pause/resume.
 
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::io::unix::AsyncFd;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 /// Size of a single read from the PTY master when `--srv-buf-size` is not set, matching
@@ -101,6 +110,9 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
     // still gets its controlling terminal.
     set_cloexec(master.as_raw_fd())?;
     set_cloexec(slave.as_raw_fd())?;
+    // Readiness-driven I/O requires this; the slave stays blocking so the child sees an
+    // ordinary terminal.
+    set_nonblocking(master.as_raw_fd())?;
 
     let mut cmd = Command::new(program);
     cmd.args(&req.argv[1..]);
@@ -136,7 +148,9 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
         .with_context(|| format!("failed to execute {program}"))?;
     drop(slave);
 
-    let pid = child.id() as i32;
+    let pid = child
+        .id()
+        .context("child exited before its pid could be read")? as i32;
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(1);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitInfo>();
@@ -144,10 +158,14 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
 
     let queued_input = Arc::new(AtomicUsize::new(0));
 
-    spawn_reader(dup_as_file(&master)?, out_tx, req.read_chunk.max(1));
-    spawn_writer(dup_as_file(&master)?, write_rx, queued_input.clone());
+    // One registration shared by both directions: `AsyncFd` tracks read and write interest
+    // separately, so the two tasks do not contend.
+    let io = Arc::new(AsyncFd::new(dup_master(&master)?).context("register pty master")?);
+    tokio::spawn(pump_output(io.clone(), out_tx, req.read_chunk.max(1)));
+    tokio::spawn(pump_input(io, write_rx, queued_input.clone()));
+
     let reaped = Arc::new(AtomicBool::new(false));
-    spawn_reaper(child, exit_tx, reaped.clone());
+    tokio::spawn(reap(child, exit_tx, reaped.clone()));
 
     Ok(Spawned {
         pty: Pty {
@@ -239,83 +257,128 @@ fn set_cloexec(fd: std::os::fd::RawFd) -> Result<()> {
     Ok(())
 }
 
-fn dup_as_file(master: &Arc<OwnedFd>) -> Result<std::fs::File> {
+fn dup_master(master: &Arc<OwnedFd>) -> Result<OwnedFd> {
     let dup = master.try_clone().context("dup pty master")?;
     set_cloexec(dup.as_raw_fd())?;
-    Ok(std::fs::File::from(dup))
+    Ok(dup)
 }
 
-fn spawn_reader(mut file: std::fs::File, tx: mpsc::Sender<Vec<u8>>, chunk: usize) {
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; chunk];
-        loop {
-            match file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    // `blocking_send` parks this thread while the client is behind, which is
-                    // what throttles the child process.
-                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
+fn set_nonblocking(fd: std::os::fd::RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl(F_GETFL)");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl(F_SETFL)");
+    }
+    Ok(())
+}
+
+/// Moves terminal output to the session, one readiness notification at a time.
+///
+/// `send` on the bounded channel awaits rather than parking a thread, which is what keeps
+/// the backpressure story intact: a client that stops reading stalls this task, the kernel
+/// PTY buffer fills, and the child blocks on its next write.
+async fn pump_output(io: Arc<AsyncFd<OwnedFd>>, tx: mpsc::Sender<Vec<u8>>, chunk: usize) {
+    let mut buf = vec![0u8; chunk];
+    loop {
+        let mut ready = match io.readable().await {
+            Ok(ready) => ready,
+            Err(_) => break,
+        };
+        match ready.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), &mut buf)) {
+            // Linux reports EIO on the master once the last slave descriptor closes, which is
+            // the normal end of a session rather than a failure.
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => {
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // Linux reports EIO on the master once the last slave descriptor is closed,
-                // which is the normal end-of-session condition rather than a failure.
-                Err(_) => break,
             }
+            // Not actually ready after all; wait for the next notification.
+            Err(_would_block) => continue,
         }
-    });
+    }
 }
 
-fn spawn_writer(
-    mut file: std::fs::File,
+/// Moves client input to the terminal, releasing the backlog accounting as bytes land.
+async fn pump_input(
+    io: Arc<AsyncFd<OwnedFd>>,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
 ) {
-    std::thread::spawn(move || {
-        while let Some(chunk) = rx.blocking_recv() {
-            let result = file.write_all(&chunk);
-            // Released only once the bytes have reached the PTY, so the ceiling measures
-            // what is actually outstanding rather than what has been handed over.
-            queued.fetch_sub(chunk.len(), Ordering::AcqRel);
-            if result.is_err() {
-                break;
+    while let Some(chunk) = rx.recv().await {
+        let mut written = 0;
+        let outcome = loop {
+            if written == chunk.len() {
+                break Ok(());
             }
+            let mut ready = match io.writable().await {
+                Ok(ready) => ready,
+                Err(e) => break Err(e),
+            };
+            match ready.try_io(|inner| write_fd(inner.get_ref().as_raw_fd(), &chunk[written..])) {
+                Ok(Ok(0)) => break Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(Ok(n)) => written += n,
+                Ok(Err(e)) => break Err(e),
+                Err(_would_block) => continue,
+            }
+        };
+        // Released only once the bytes have reached the PTY, so the ceiling measures what is
+        // actually outstanding rather than what has been handed over.
+        queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+        if outcome.is_err() {
+            break;
         }
-        // Whatever is still queued will never be written now. Leaving it counted would pin
-        // the backlog above its ceiling forever, and the session gates its socket reads on
-        // that — it would stop reading from its client and never start again.
-        rx.close();
-        while let Ok(chunk) = rx.try_recv() {
-            queued.fetch_sub(chunk.len(), Ordering::AcqRel);
-        }
-        queued.store(0, Ordering::Release);
-    });
+    }
+    // Whatever is still queued will never be written now. Leaving it counted would pin the
+    // backlog above its ceiling forever, and the session gates its socket reads on that — it
+    // would stop reading from its client and never start again.
+    rx.close();
+    while let Ok(chunk) = rx.try_recv() {
+        queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+    }
+    queued.store(0, Ordering::Release);
 }
 
-fn spawn_reaper(mut child: Child, tx: oneshot::Sender<ExitInfo>, reaped: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        let info = match child.wait() {
-            Ok(status) => match status.signal() {
-                Some(sig) => ExitInfo {
-                    code: 128 + sig,
-                    signal: Some(sig),
-                },
-                None => ExitInfo {
-                    code: status.code().unwrap_or(0),
-                    signal: None,
-                },
+fn read_fd(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+fn write_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
+/// Awaits the child through the runtime's SIGCHLD handling rather than a thread per child.
+async fn reap(mut child: Child, tx: oneshot::Sender<ExitInfo>, reaped: Arc<AtomicBool>) {
+    let info = match child.wait().await {
+        Ok(status) => match status.signal() {
+            Some(sig) => ExitInfo {
+                code: 128 + sig,
+                signal: Some(sig),
             },
-            Err(_) => ExitInfo {
-                code: -1,
+            None => ExitInfo {
+                code: status.code().unwrap_or(0),
                 signal: None,
             },
-        };
-        // Flag before publishing the status: once waitpid has returned, the pid is free for
-        // reuse and must never be signalled again.
-        reaped.store(true, Ordering::SeqCst);
-        let _ = tx.send(info);
-    });
+        },
+        Err(_) => ExitInfo {
+            code: -1,
+            signal: None,
+        },
+    };
+    // Flag before publishing the status: once waitpid has returned, the pid is free for
+    // reuse and must never be signalled again.
+    reaped.store(true, Ordering::SeqCst);
+    let _ = tx.send(info);
 }
 
 #[cfg(test)]
