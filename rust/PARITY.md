@@ -25,10 +25,27 @@ exposed were used to write more tests until only unreachable error paths remaine
 
 ## Results
 
-| | Tests | Line coverage |
+Coverage is reported against three explicitly different denominators, because a single
+number invites a comparison the method does not support. The first two rows are the
+like-for-like pair: the same 97 shared tests, run against each build.
+
+| Measured | Scope | Line coverage |
 |---|---|---|
-| C reference (`src/*.c`, 966 lines) | 97 run against it, all passing | **88.72 %** |
-| Rust port (`rust/src/*.rs`, 2760 lines) | 208 total, all passing | **92.9 %** |
+| C reference (`src/*.c`, 966 lines) | the 97 shared parity tests | **88.72 %** |
+| Rust port (`rust/src/*.rs`, 1950 lines reached) | the same 97 shared parity tests | **78.56 %** |
+| Rust port, excluding `auth.rs` (1756 lines) | the same 97 shared parity tests | **84.28 %** |
+| Rust port (2760 lines) | all 208 tests, including unit and forward-auth | **92.9 %** |
+
+The comparable pair is the first two rows, and it does not favour this port: the shared
+suite reaches **less** of the Rust code than of the C code. Most of that gap is
+`auth.rs` at 26.80 %, which is forward authentication — a feature the C build does not
+have, so no shared test can reach it by construction; it is covered instead by the 19
+`forward_auth` tests, which have nothing to run against. Excluding it closes the gap to
+about four points. The rest is that this port carries roughly twice the code of the
+original, some of it error handling with no C equivalent.
+
+The last row is the number to use when asking "how much of this port is tested at all",
+and the one that should *not* be set beside the C figure.
 
 Test inventory:
 
