@@ -77,8 +77,17 @@ pub async fn handler(
         state.client_count()
     );
 
+    // tungstenite eagerly allocates its read buffer at `read_buffer_size` in
+    // `FrameCodec::new` — 128 KiB by default, and it dominated this server's per-connection
+    // memory: a `gdb` catchpoint on `mmap` traced a single 128 KiB allocation to
+    // `BytesMut::with_capacity` there, and 138 kB per connection came almost entirely from
+    // it. (The write buffer is lazy, which is why sizing *it* down changed nothing.) The
+    // read buffer holds only client-to-server traffic — keystrokes, resize messages, the
+    // opening JSON frame — which is small; a paste larger than this still works because the
+    // buffer grows on demand, it just no longer costs every idle terminal 128 KiB up front.
     upgrade
         .protocols([protocol::SUBPROTOCOL])
+        .read_buffer_size(16 * 1024)
         .on_upgrade(move |socket| async move {
             session(socket, state, user.0, args, slot).await;
         })

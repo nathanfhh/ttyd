@@ -436,21 +436,31 @@ was taken while an eight-minute browser soak was running on the same machine. Th
 happened to survive a clean re-run, but they should not have been reported. These figures
 come from a run with nothing else scheduled.
 
-**Where C wins is memory per session, decisively**: 17 kB against 205 kB. At
-`--max-clients 100` that is 1.7 MB against 20 MB. Decomposed by connection stage:
+**C still wins on memory per session, but the gap is now 5.5×, not 12×.** The dominant cost
+was found and removed.
 
-| | RSS per connection |
-|---|---|
-| plain HTTP connection | 64 kB |
-| WebSocket upgraded, no terminal opened | 187 kB |
-| full terminal session | 219 kB |
+Decomposing per-connection RSS before and after:
 
-So the terminal session itself now costs about 30 kB, near the C build's 17.8 kB; the
-remainder is the HTTP/WebSocket layer. A `smaps` diff attributes 138 kB per connection to
-anonymous `mmap`, which points at a single allocation above glibc's 128 kB `mmap` threshold.
-Sizing tungstenite's write buffer down from its 128 kB default changed nothing — 187 kB with
-an 8 kB buffer, 181 kB with a 1 MB one — so that is not the source, and the change was
-reverted rather than kept on a hypothesis. This is an open question, not a solved one.
+| stage | before | after |
+|---|---|---|
+| plain HTTP connection | 64 kB | 64 kB |
+| WebSocket upgraded, no terminal opened | 187 kB | 62 kB |
+| full terminal session | 219 kB | 104 kB |
+
+The 125 kB the WebSocket upgrade added was a single 128 KiB allocation. A `gdb` catchpoint on
+`mmap`, against a debug-symbol build, traced it to `tungstenite::FrameCodec::new` calling
+`BytesMut::with_capacity` — the **read** buffer, whose `read_buffer_size` defaults to 128 KiB
+and is allocated eagerly the moment a socket upgrades. (An earlier attempt sized the *write*
+buffer down and saw no change; the write buffer is lazy, which is why. The two are separate
+knobs and only the read one is eager.) The read buffer carries client-to-server traffic only —
+keystrokes, resize messages, the opening frame — so it is sized to 16 KiB, and a larger paste
+still works because `BytesMut` grows on demand, verified by echoing a 1 MB single frame back
+through `cat` on both builds.
+
+What remains is the ~64 kB every connection costs before it is even a WebSocket — hyper's own
+per-connection buffers. That is a smaller target, it is load-bearing for HTTP throughput, and
+it was left alone rather than chased on a hypothesis. The terminal session itself now adds
+about 40 kB on top of that.
 
 ## Soak
 
