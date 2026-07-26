@@ -53,21 +53,47 @@ fn emit_version() {
     // rewrites `.git/refs/heads/<branch>` instead. Watching HEAD alone leaves the version
     // stamp frozen at whatever commit the binary was first built from, which is worse than
     // having no stamp: it misidentifies a deployed binary.
-    let git_dir = PathBuf::from("../.git");
-    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) {
+    //
+    // Both directories come from git rather than from assuming `../.git` is one. In a
+    // worktree or a submodule `.git` is a *file* holding `gitdir: …`, so the assumed paths
+    // would simply not exist and the stamp would go stale again — silently, which is the
+    // failure mode this watching exists to prevent.
+    let head_dir = git_path(&["rev-parse", "--absolute-git-dir"]);
+    // A linked worktree has its own HEAD but shares refs/ and packed-refs with the main
+    // checkout, so the two can be different directories.
+    let refs_dir = git_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .or_else(|| head_dir.clone());
+
+    let Some(head_dir) = head_dir else { return };
+    let Some(refs_dir) = refs_dir else { return };
+
+    watch(&head_dir.join("HEAD"));
+    if let Ok(head) = fs::read_to_string(head_dir.join("HEAD")) {
         if let Some(reference) = head.strip_prefix("ref:") {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(reference.trim()).display()
-            );
+            watch(&refs_dir.join(reference.trim()));
         }
     }
     // A ref that lives in `packed-refs` has no loose file to watch.
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join("packed-refs").display()
-    );
+    watch(&refs_dir.join("packed-refs"));
+}
+
+/// Runs a `git rev-parse` that yields a path, returning `None` outside a repository or when
+/// git is not installed — a source tarball builds fine, just without a hash in the version.
+fn git_path(args: &[&str]) -> Option<PathBuf> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Emits `rerun-if-changed` only for a path that exists. Naming a missing path makes cargo
+/// re-run the build script on *every* build, which is a quiet waste rather than an error.
+fn watch(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn parse_header(path: &Path) -> (Vec<u8>, usize) {

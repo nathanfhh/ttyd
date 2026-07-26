@@ -14,7 +14,9 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-BIN = sys.argv[1] if len(sys.argv) > 1 else "/home/user/ttyd/rust/target/release/ttyd"
+REPO = pathlib.Path(__file__).resolve().parent
+
+BIN = sys.argv[1] if len(sys.argv) > 1 else str(REPO / "target" / "release" / "ttyd")
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "rust"
 WORK = pathlib.Path(f"/tmp/ttyd-browser-{LABEL}")
 # Each run starts from an empty directory, so nothing a previous run left behind (a vim
@@ -89,11 +91,37 @@ def wait_for_file(path, timeout=15):
     return None
 
 
+def launch_chromium(pw):
+    """Prefers Playwright's own managed browser, which is what a contributor will have.
+
+    Falls back to whatever Chromium is installed under PLAYWRIGHT_BROWSERS_PATH. A CI image
+    that ships a pinned browser build often does not match the build number the installed
+    `playwright` package expects, and the managed launch then fails with "Executable doesn't
+    exist" even though a perfectly good Chromium is sitting right there. Set
+    TTYD_CHROMIUM to point at a specific binary and neither guess is used.
+    """
+    def launch(**kw):
+        return pw.chromium.launch(args=["--no-sandbox"], **kw)
+
+    override = os.environ.get("TTYD_CHROMIUM")
+    if override:
+        return launch(executable_path=override)
+
+    try:
+        return launch()
+    except Exception as managed_error:
+        root = pathlib.Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+        candidates = sorted(root.glob("chromium*/chrome-linux/chrome")) if root.name else []
+        if not candidates:
+            raise
+        # Highest build number last, which is the closest to what the package wants.
+        print(f"  (managed browser unavailable: {str(managed_error).splitlines()[0]})")
+        print(f"  (falling back to {candidates[-1]})")
+        return launch(executable_path=str(candidates[-1]))
+
+
 with sync_playwright() as pw:
-    browser = pw.chromium.launch(
-        args=["--no-sandbox"],
-        executable_path="/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
-    )
+    browser = launch_chromium(pw)
     page = browser.new_page(
         viewport={"width": 1100, "height": 700},
         # The certificate is generated per run by a throwaway CA the browser has no reason

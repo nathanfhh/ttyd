@@ -117,10 +117,16 @@ and the session never drops. It also leaves screenshots behind for a look at col
 box-drawing output.
 
 ```sh
-pip install playwright
+pip install playwright && playwright install chromium
 python3 browser-check.py                          # this build
 python3 browser-check.py /path/to/c/ttyd c        # and the C build, for comparison
+TTYD_BROWSER_TLS=1 python3 browser-check.py       # the same run over HTTPS
 ```
+
+It uses Playwright's own Chromium. On an image that ships a pinned browser build the
+managed launch can fail even though a usable Chromium is installed, in which case the
+script falls back to one found under `PLAYWRIGHT_BROWSERS_PATH` and says so; set
+`TTYD_CHROMIUM=/path/to/chrome` to choose the binary yourself.
 
 ## Compatibility
 
