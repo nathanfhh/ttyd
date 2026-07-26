@@ -10,13 +10,22 @@ use std::process::Command;
 use std::time::Duration;
 
 fn openssl(args: &[&str], what: &str) {
-    let status = Command::new("openssl")
+    // Output is captured rather than discarded so a failure here names its own cause. When
+    // certificate generation breaks — a missing algorithm, an openssl.cnf the container does
+    // not have, a read-only directory — every TLS test fails at once, and "openssl failed to
+    // generate a CA" on its own gives nothing to act on.
+    let output = Command::new("openssl")
         .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .expect("openssl must be available to generate test certificates");
-    assert!(status.success(), "openssl failed to {what}");
+    assert!(
+        output.status.success(),
+        "openssl failed to {what} (status {}): openssl {}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+        output.status,
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+    );
 }
 
 /// A throwaway certificate authority plus a leaf certificate it signed for `127.0.0.1`.

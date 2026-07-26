@@ -39,7 +39,11 @@ if USE_TLS:
     ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
 
     def openssl(*a):
-        subprocess.run(["openssl", *a], check=True, capture_output=True)
+        result = subprocess.run(["openssl", *a], capture_output=True, text=True)
+        if result.returncode:
+            raise SystemExit(
+                f"openssl {' '.join(a)} failed ({result.returncode}):\n{result.stderr}"
+            )
 
     openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
             "-subj", "/CN=ttyd-browser-ca",
@@ -73,10 +77,21 @@ while time.time() < deadline and port is None:
 assert port, "server never reported a port"
 print(f"  server on port {port}")
 
-# Keep draining for the rest of the run. Reading only until the port line lets the log fill
-# the 64 kB pipe buffer, after which the server blocks in write() and looks exactly like a
-# frozen server — the failure PARITY.md records from the first soak attempt.
-threading.Thread(target=lambda: [None for _ in proc.stderr], daemon=True).start()
+
+def drain_stderr():
+    """Keeps the server's log pipe empty for the rest of the run.
+
+    Reading only until the port line lets the log fill the 64 kB pipe buffer, after which
+    the server blocks in write() and looks exactly like a frozen server — the failure
+    PARITY.md records from the first soak attempt. The lines are discarded rather than
+    collected: a comprehension would keep one object per line for the life of the run, which
+    trades a blocked server for an unbounded one.
+    """
+    for _ in proc.stderr:
+        pass
+
+
+threading.Thread(target=drain_stderr, daemon=True).start()
 
 failures = []
 
