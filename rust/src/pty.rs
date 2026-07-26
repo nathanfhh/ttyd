@@ -25,10 +25,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-/// Size of a single read from the PTY master when `--srv-buf-size` is not set, matching
-/// libuv's suggested buffer size.
-pub const DEFAULT_READ_CHUNK: usize = 65536;
-
 /// How much unwritten terminal input may be queued for one child before the session stops
 /// reading from its client.
 ///
@@ -393,7 +389,8 @@ mod tests {
             cwd: None,
             columns: 80,
             rows: 24,
-            read_chunk: DEFAULT_READ_CHUNK,
+            // The production default: `--srv-buf-size`, which `cli` sets to 4096.
+            read_chunk: 4096,
         }
     }
 

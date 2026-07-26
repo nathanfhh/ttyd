@@ -3,7 +3,7 @@
 use crate::auth::Authenticator;
 use crate::cli::Config;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -31,7 +31,6 @@ pub struct AppState {
     pub auth: Arc<Authenticator>,
     client_count: AtomicI64,
     /// Set once the server has decided to exit but is waiting for a child process to die,
-    accepting: AtomicBool,
     shutdown: watch::Sender<bool>,
     /// Process-group leaders of every running child. Shutdown signals these directly rather
     /// than waiting for each session task to notice, which under load it may not do in time.
@@ -44,7 +43,6 @@ impl AppState {
             cfg,
             auth,
             client_count: AtomicI64::new(0),
-            accepting: AtomicBool::new(true),
             shutdown: watch::channel(false).0,
             children: Mutex::new(HashSet::new()),
         })
@@ -110,14 +108,16 @@ impl AppState {
         signalled
     }
 
-    pub fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::SeqCst)
-    }
-
     /// Stops the accept loop and tells live sessions to wind down.
+    ///
+    /// `send_replace` rather than `send`: `send` returns an error *and leaves the value
+    /// unchanged* when no receiver happens to be subscribed at that instant, and the error
+    /// was being discarded. `wait_for_shutdown` subscribes per call, so there is a window —
+    /// the accept loop inside a branch body, with no live sessions — where a signal would
+    /// have been dropped and the server would have ignored SIGTERM entirely. Recording the
+    /// value unconditionally is what makes this method's guarantee true.
     pub fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::SeqCst);
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Resolves once shutdown has begun, including when it began before this was called.
@@ -134,6 +134,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::cli::AuthMode;
+    use std::time::Duration;
 
     fn state(mutate: impl FnOnce(&mut Config)) -> Arc<AppState> {
         let mut cfg = Config {
@@ -172,11 +173,26 @@ mod tests {
         assert!(!s.try_acquire_client());
     }
 
-    #[test]
-    fn shutdown_stops_accepting() {
+    #[tokio::test]
+    async fn shutdown_stops_accepting() {
+        // Asserted against the mechanism the accept loop actually selects on. An earlier
+        // version checked an `accepting` flag that `begin_shutdown` set and nothing read —
+        // so the test passed while proving nothing about whether accepting stops.
         let s = state(|_| {});
-        assert!(s.is_accepting());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), s.wait_for_shutdown())
+                .await
+                .is_err(),
+            "shutdown was signalled before it began"
+        );
+
         s.begin_shutdown();
-        assert!(!s.is_accepting());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), s.wait_for_shutdown())
+                .await
+                .is_ok(),
+            "the accept loop would never have woken"
+        );
     }
 }

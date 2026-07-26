@@ -264,6 +264,14 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **`begin_shutdown` could silently drop the signal, leaving SIGTERM ignored.** It used
+  `watch::Sender::send` and discarded the error — but that method returns an error *and
+  leaves the value unchanged* when no receiver is subscribed at that instant. Since
+  `wait_for_shutdown` subscribes per call, there is a window (the accept loop inside a branch
+  body, no live sessions) in which a signal would vanish and the server would keep running.
+  `send_replace` records the value unconditionally. Found while removing an `accepting` flag
+  that nothing read: retargeting its test at the mechanism the accept loop *actually* selects
+  on turned a test that passed while proving nothing into one that failed for a real reason.
 - **A `force_exit` flag was carried over but never read.** The C build checks it in two
   places — a second signal escalates to an immediate exit, and a finished child ends the
   process. Both behaviours exist in this port, implemented by other means (a `select!` on a

@@ -5,7 +5,6 @@
 //! the child blocks on write. That is the same backpressure the C version gets from libuv's
 //! explicit read pause/resume.
 
-use crate::cli::AuthMode;
 use crate::http::AuthenticatedUser;
 use crate::protocol::{self, OpenMessage};
 use crate::pty::{self, ExitInfo, SpawnRequest};
@@ -572,11 +571,6 @@ fn normalize_origin(origin: &str) -> Option<String> {
     } else {
         Some(format!("{host}:{port}"))
     }
-}
-
-/// Whether the WebSocket layer must additionally verify the `AuthToken` field.
-pub fn ws_token_required(mode: &AuthMode) -> bool {
-    matches!(mode, AuthMode::Basic { .. })
 }
 
 #[cfg(test)]
