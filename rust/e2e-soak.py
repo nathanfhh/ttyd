@@ -66,6 +66,8 @@ try:
     # ---------------------------------------------------------------- synthetic churn
     stop = threading.Event()
     churn = {"sessions": 0, "errors": 0}
+    churn_errors = []
+    churn_started = time.time()
     lock = threading.Lock()
 
 
@@ -105,9 +107,16 @@ try:
                 s.close()
                 with lock:
                     churn["sessions"] += 1
-            except Exception:
+            except Exception as exc:
                 with lock:
                     churn["errors"] += 1
+                    # Recorded, not merely counted. One unexplained error in a thousand
+                    # sessions is exactly what gets waved through as noise, and without the
+                    # message there is nothing left to diagnose afterwards.
+                    churn_errors.append(
+                        f"t={int(time.time() - churn_started):>4}s "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 time.sleep(0.5)
 
 
@@ -240,6 +249,8 @@ print(f"  uncaught frontend errors: {len(page_errors)}" + (f" -> {page_errors[:2
 print(f"  server still alive: {alive}")
 with lock:
     print(f"  churn sessions: {churn['sessions']}, churn errors: {churn['errors']}")
+    for line in churn_errors[:10]:
+        print(f"    {line}")
 
 if len(samples) >= 3:
     _, rss0, fd0, th0 = samples[1]
