@@ -43,6 +43,9 @@ cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
 build
+# Out-of-tree builds, including the C reference build the Rust port's
+# differential test suite compares against (see rust/PARITY.md).
+build-*/
 
 # Clion files
 .idea/
