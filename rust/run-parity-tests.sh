@@ -9,7 +9,9 @@
 #   ./run-parity-tests.sh /path/to/c/ttyd       # both, and compare
 set -uo pipefail
 
-cd "$(dirname "$0")"
+# Without this guard a failed cd would silently run the whole suite from the caller's
+# directory, against whatever binary happened to be there.
+cd "$(dirname "$0")" || exit 1
 
 C_BINARY="${1:-}"
 SUITES=(cli_parity http_parity ws_parity tls_parity lifecycle_parity)

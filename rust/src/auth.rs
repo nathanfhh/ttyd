@@ -261,8 +261,20 @@ fn build_subrequest_headers(
     state: &ForwardState,
     ctx: &RequestContext<'_>,
 ) -> Vec<(String, String)> {
-    let mut out = collect_forwarded_headers(state, ctx);
-    out.extend(original_request_metadata(ctx));
+    let metadata = original_request_metadata(ctx);
+
+    // A client copy is dropped when it collides with something synthesized here. Headers are
+    // sent as appends, so an operator who lists `x-forwarded-for` in `--auth-request-header`
+    // would otherwise have the *client's* value arrive first, ahead of the observed peer —
+    // which is exactly the substitution `original_request_metadata` refuses to allow.
+    let synthesized: std::collections::HashSet<&str> =
+        metadata.iter().map(|(name, _)| name.as_str()).collect();
+    let mut out: Vec<(String, String)> = collect_forwarded_headers(state, ctx)
+        .into_iter()
+        .filter(|(name, _)| !synthesized.contains(name.as_str()))
+        .collect();
+
+    out.extend(metadata);
     out
 }
 

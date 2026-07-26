@@ -173,6 +173,8 @@ async fn session(
 
     let mut paused = false;
     let mut exit_info: Option<ExitInfo> = None;
+    // Whether the exit receiver has completed, however it completed.
+    let mut exit_observed = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     // Distinguishes "the terminal reached end of file" from "the browser hung up", because
     // only the former is worth waiting on an exit status for.
@@ -245,7 +247,12 @@ async fn session(
                     }
                 }
             }
-            reaped = &mut exit, if exit_info.is_none() => {
+            // Guarded on whether the receiver has produced anything at all, not on whether
+            // it produced a *status*. A dropped sender yields `Err`, leaving `exit_info`
+            // empty — and a `oneshot::Receiver` is not fused, so polling it a second time
+            // panics rather than pending.
+            reaped = &mut exit, if !exit_observed => {
+                exit_observed = true;
                 if let Ok(info) = reaped {
                     tracing::info!("process exited with code {}, pid: {}", info.code, pty.pid);
                     exit_info = Some(info);
@@ -463,6 +470,12 @@ fn parse_url_args(query: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Combines two ASCII hex digits into a byte, or `None` if either is not a hex digit.
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    Some(digit(high)? << 4 | digit(low)?)
+}
+
 /// Decodes one query-string value: `+` means a space, `%XX` is a byte escape. Invalid
 /// escapes are left as written rather than dropped, so nothing silently disappears.
 fn decode_query_value(raw: &str) -> String {
@@ -475,12 +488,15 @@ fn decode_query_value(raw: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&raw[i + 1..i + 3], 16) {
-                Ok(byte) => {
+            // Decoded from the bytes, never by slicing the `&str`: `i + 1..i + 3` is a byte
+            // range, and on input like `%aé` it lands inside a multi-byte character, which
+            // panics. The query string is attacker-controlled, so that is reachable.
+            b'%' if i + 2 < bytes.len() => match hex_pair(bytes[i + 1], bytes[i + 2]) {
+                Some(byte) => {
                     out.push(byte);
                     i += 3;
                 }
-                Err(_) => {
+                None => {
                     out.push(bytes[i]);
                     i += 1;
                 }
@@ -569,6 +585,19 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn a_percent_escape_next_to_a_multibyte_character_does_not_panic() {
+        // `%aé` is `% a C3 A9`: slicing the &str at byte 3 lands inside `é`. The query
+        // string comes straight off the wire, so this was a remote panic.
+        assert_eq!(decode_query_value("%aé"), "%aé");
+        assert_eq!(decode_query_value("%é"), "%é");
+        assert_eq!(decode_query_value("中%文"), "中%文");
+        assert_eq!(decode_query_value("%f0%9f%92%a9"), "💩");
+        // Still decodes what it should, and still leaves a bad escape alone.
+        assert_eq!(decode_query_value("a%20b"), "a b");
+        assert_eq!(decode_query_value("%zz"), "%zz");
     }
 
     #[test]

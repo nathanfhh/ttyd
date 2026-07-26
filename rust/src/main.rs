@@ -27,7 +27,9 @@ fn main() -> std::process::ExitCode {
     match runtime.block_on(run(cfg)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("{e:#}");
+            // Not `tracing::error!`: `-d 0` installs no subscriber at all, so the process
+            // would exit 1 having said nothing about why.
+            eprintln!("ttyd: {e:#}");
             std::process::ExitCode::from(1)
         }
     }

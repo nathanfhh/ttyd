@@ -94,6 +94,14 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
     let master = Arc::new(pty.master);
     let slave = pty.slave;
 
+    // Marked close-on-exec before anything can fork, not after this child is spawned:
+    // another session starting concurrently would otherwise inherit this terminal's master
+    // descriptor and be able to read and write someone else's session. `Stdio` dup2s the
+    // slave onto 0/1/2 in the child, and dup2 clears the flag on the copy, so the child
+    // still gets its controlling terminal.
+    set_cloexec(master.as_raw_fd())?;
+    set_cloexec(slave.as_raw_fd())?;
+
     let mut cmd = Command::new(program);
     cmd.args(&req.argv[1..]);
     for (key, value) in req.env {
@@ -129,8 +137,6 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned> {
     drop(slave);
 
     let pid = child.id() as i32;
-
-    set_cloexec(master.as_raw_fd())?;
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(1);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitInfo>();
@@ -264,6 +270,14 @@ fn spawn_writer(
                 break;
             }
         }
+        // Whatever is still queued will never be written now. Leaving it counted would pin
+        // the backlog above its ceiling forever, and the session gates its socket reads on
+        // that — it would stop reading from its client and never start again.
+        rx.close();
+        while let Ok(chunk) = rx.try_recv() {
+            queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+        }
+        queued.store(0, Ordering::Release);
     });
 }
 

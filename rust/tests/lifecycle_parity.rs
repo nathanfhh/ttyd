@@ -25,6 +25,40 @@ async fn open_session(ws: &mut common::WsStream) {
         .expect("preferences frame");
 }
 
+/// Spawns ttyd on a port chosen here rather than by the kernel, retrying when another test
+/// wins the race for it.
+///
+/// Binding a port-0 listener and dropping it does not reserve the port, so a concurrently
+/// running test can take it before the child does; the child then fails to start and the
+/// failure surfaces as an unrelated assertion. Used only by tests that cannot discover the
+/// port from the log — because they assert on the log itself, or on the URL containing it.
+fn spawn_on_a_free_port(
+    build: impl Fn(u16) -> std::process::Command,
+    ready: impl Fn(u16) -> bool,
+) -> (std::process::Child, u16) {
+    for _ in 0..20 {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe address").port()
+        };
+        let mut child = build(port).spawn().expect("spawn");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if ready(port) {
+                return (child, port);
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break; // Lost the race, or failed to start — try another port.
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    panic!("could not start ttyd on a free port after 20 attempts");
+}
+
 #[test]
 fn a_negative_port_is_rejected() {
     let result = run_cli(&["-p", "-1", "bash"]);
@@ -52,29 +86,25 @@ async fn a_low_debug_level_silences_the_log_without_silencing_the_server() {
     // `-d` is the libwebsockets level bitmask: 1 is errors only, so the startup notices go
     // away while the server keeps serving. Verified to match the C build, which is equally
     // silent at `-d 1`. Without this the option is only proved to parse.
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        probe.local_addr().expect("addr").port()
-    };
-    let mut child = std::process::Command::new(common::binary())
-        .args(["-p", &port.to_string(), "-d", "1", "bash"])
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn");
+    let (mut child, port) = spawn_on_a_free_port(
+        |port| {
+            let mut c = std::process::Command::new(common::binary());
+            c.args(["-p", &port.to_string(), "-d", "1", "bash"])
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null());
+            c
+        },
+        |port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+    );
 
     let client = common::http_client();
     let url = format!("http://127.0.0.1:{port}/token");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut served = false;
-    while std::time::Instant::now() < deadline {
-        if let Ok(r) = client.get(&url).send().await {
-            served = r.status() == 200;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(served, "the server must still serve at -d 1");
+    let response = client.get(&url).send().await.expect("request");
+    assert_eq!(
+        response.status(),
+        200,
+        "the server must still serve at -d 1"
+    );
 
     unsafe {
         libc::kill(child.id() as i32, libc::SIGKILL);
@@ -175,17 +205,17 @@ async fn the_browser_option_launches_the_system_opener_with_the_url() {
         dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        probe.local_addr().expect("addr").port()
-    };
-    let mut child = std::process::Command::new(common::binary())
-        .args(["-p", &port.to_string(), "-B", "bash"])
-        .env("PATH", path)
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn");
+    let (mut child, port) = spawn_on_a_free_port(
+        |port| {
+            let mut c = std::process::Command::new(common::binary());
+            c.args(["-p", &port.to_string(), "-B", "bash"])
+                .env("PATH", &path)
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null());
+            c
+        },
+        |port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !marker.exists() && std::time::Instant::now() < deadline {

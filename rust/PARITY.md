@@ -28,19 +28,19 @@ exposed were used to write more tests until only unreachable error paths remaine
 | | Tests | Line coverage |
 |---|---|---|
 | C reference (`src/*.c`, 966 lines) | 93 run against it, all passing | **88.72 %** |
-| Rust port (`rust/src/*.rs`, 2618 lines) | 195 total, all passing | **92.78 %** |
+| Rust port (`rust/src/*.rs`, 2652 lines) | 197 total, all passing | **92.8 %** |
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 84 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 85 | no — internal APIs |
 | `cli_parity` | 12 | yes |
 | `http_parity` | 18 | yes |
 | `ws_parity` | 33 | yes |
 | `tls_parity` | 4 | yes |
 | `lifecycle_parity` | 26 | yes |
-| `forward_auth` | 18 | no — new feature |
+| `forward_auth` | 19 | no — new feature |
 
 86 of the 93 shared tests assert identical behaviour on both binaries. The remaining seven
 are the documented divergences below plus the tests covering behaviour the C build does not
@@ -217,6 +217,42 @@ approach above was blind.
   session task waking up to signal its own child; under parallel load a task could miss the
   window, and since every child leads its own process group nothing else would reap it. The
   server now signals the registered children itself before exiting.
+- **A query string could panic the connection task.** `decode_query_value` read `%XX`
+  escapes by slicing the `&str` at byte offsets, which are not character boundaries: `?arg=%aé`
+  slices into the middle of `é` and panics. The query string comes straight off the wire, so
+  any client could kill its own connection task at will with `--url-arg` enabled — confirmed
+  against a running server, which logged `panicked at src/ws.rs:478`. Escapes are now decoded
+  from the byte slice.
+- **`-6` was ignored whenever `-i <name>` named an interface with an IPv4 address.** The v6
+  branch fell through into the v4 branch, and a v4 address is usually enumerated first, so
+  the common case silently bound IPv4. It now skips non-v6 entries and reports an error when
+  the interface has no IPv6 address at all.
+- **A failed `accept` spun the loop at full CPU.** Both accept loops discarded the error and
+  continued immediately. `EMFILE`/`ENFILE` from descriptor exhaustion is not transient, so
+  `accept` fails again at once — the loop busy-spins a core and starves the runtime that
+  would otherwise be closing the connections which free those descriptors. Failures are now
+  logged and backed off.
+- **The UNIX socket was world-connectable for a moment even after the `chmod`.** Tightening
+  the mode after `bind` leaves a window in which it carries the process umask. Binding now
+  happens under a umask that already denies everyone else, and the `chmod` confirms the
+  result rather than being the only thing standing between the socket and the rest of the box.
+- **The PTY master was marked close-on-exec after the child had been spawned.** Between
+  `openpty` and that point, any other session starting concurrently would fork with the
+  descriptor open and inherit it — one terminal readable and writable from another session's
+  child. Both ends are now marked before anything can fork; the slave still reaches the child
+  because `dup2` clears the flag on the copy.
+- **A forwarded header could be reintroduced by the operator.** Listing `x-forwarded-for` in
+  `--auth-request-header` — a natural thing to do, not knowing it is synthesized — sent the
+  client's value *and* the observed peer, client copy first, defeating the guarantee that only
+  the observed address is forwarded. Client copies that collide with the synthesized set are
+  now dropped.
+- **The exit receiver could be polled after completion.** The branch was guarded on
+  `exit_info.is_none()`, but a dropped sender yields `Err` and leaves `exit_info` empty, so
+  the guard stayed true — and `oneshot::Receiver` is not fused, so the next poll panics. It is
+  now guarded on whether the receiver has completed at all.
+- **A fatal error was invisible at `-d 0`.** The startup failure path used `tracing::error!`,
+  but `-d 0` installs no subscriber, so the process exited 1 having said nothing. It writes to
+  stderr directly.
 - **`--check-origin` accepted origins the C build refuses, and refused ones it accepts.**
   `check_host_origin` drops `:80` and `:443` from the origin whatever the scheme, and matches
   the scheme itself exactly and case-sensitively. This port dropped only the scheme's own
@@ -331,6 +367,20 @@ That was the harness: it read the server's stderr only until the port line appea
 the log filled the 64 kB pipe buffer and the server blocked in `write()`. Recorded because
 the failure looked exactly like a server defect until the stack was inspected — the same
 class of mistake as the vi false alarm above.
+
+## Declined, with reasons
+
+Not everything raised in review is a defect to fix. These were checked against the C build
+and left alone, because changing them would be a divergence rather than a correction:
+
+- **`--browser` waits for the launched process.** `open_uri` uses a blocking `status()`, so a
+  handler that stays in the foreground delays the accept loop. The C build does exactly the
+  same thing — `fork` followed by `waitpid` in `utils.c` — so this is parity, not a
+  regression, and `xdg-open` detaches in practice.
+- **The display probe only detects X11.** `xset -q` is missing on a Wayland session without
+  Xwayland, so `--browser` quietly does nothing there. Again, the C build runs the identical
+  probe (`system("xset -q > /dev/null 2>&1")`). Worth fixing upstream in both, not worth
+  diverging here.
 
 ## Dependencies
 

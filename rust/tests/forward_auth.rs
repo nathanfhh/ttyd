@@ -432,6 +432,46 @@ async fn the_client_cannot_choose_its_own_forwarded_address() {
 }
 
 #[tokio::test]
+async fn listing_a_synthesized_header_cannot_reintroduce_the_clients_value() {
+    // The guarantee above holds only while nothing puts the client's copy back. Headers go
+    // out as appends, so an operator who names `x-forwarded-for` in --auth-request-header —
+    // a natural thing to do, not knowing it is already synthesized — would otherwise have
+    // the attacker-supplied value arrive first, ahead of the observed peer.
+    if is_c_reference() {
+        return;
+    }
+    let auth = MockAuth::start(Reply::ok()).await;
+    let server = Server::start(&[
+        "--auth-url",
+        &auth.url(),
+        "--auth-request-header",
+        "X-Forwarded-For",
+        "--auth-request-header",
+        "X-Forwarded-Proto",
+        "bash",
+    ]);
+
+    http_client()
+        .get(server.http_url("/"))
+        .header("X-Forwarded-For", "10.0.0.1")
+        .header("X-Forwarded-Proto", "https")
+        .send()
+        .await
+        .expect("request");
+
+    let requests = auth.requests();
+    let seen = requests.first().expect("one request");
+    assert_eq!(
+        seen.headers["x-forwarded-for"], "127.0.0.1",
+        "the client's X-Forwarded-For must not reach the endpoint even when listed"
+    );
+    assert_eq!(
+        seen.headers["x-forwarded-proto"], "http",
+        "the observed scheme must win over the client's claim"
+    );
+}
+
+#[tokio::test]
 async fn rejections_are_never_cached() {
     if is_c_reference() {
         return;

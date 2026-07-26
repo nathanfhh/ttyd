@@ -107,12 +107,19 @@ impl Server {
             }
         }
 
-        let port = port.unwrap_or_else(|| {
-            panic!(
-                "ttyd did not report a listening port; output so far:\n{}",
-                collected.join("\n")
-            )
-        });
+        let port = match port {
+            Some(port) => port,
+            None => {
+                // `Child::drop` neither kills nor reaps, so panicking here would leave this
+                // ttyd and its shell running for the rest of the suite.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "ttyd did not report a listening port; output so far:\n{}",
+                    collected.join("\n")
+                )
+            }
+        };
 
         Server {
             child,

@@ -2,7 +2,7 @@
 name = "ttyd"
 version = "1.7.7"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.86"
 description = "Share your terminal over the web"
 license = "MIT"
 repository = "https://github.com/tsl0922/ttyd"

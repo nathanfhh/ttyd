@@ -18,6 +18,9 @@ use tower::ServiceExt;
 /// is a handshake or plain HTTP.
 const TLS_SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait after a failed `accept` before trying again.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 /// The listening socket, which is either a TCP port or a UNIX domain socket.
 pub enum Listener {
     Tcp(TcpListener),
@@ -45,8 +48,15 @@ pub async fn bind(cfg: &Config) -> Result<Listener> {
             std::fs::remove_file(&path)
                 .with_context(|| format!("cannot remove stale socket {}", path.display()))?;
         }
-        let listener = UnixListener::bind(&path)
-            .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
+        // Created under a umask that already denies everyone else, because `chmod`ing after
+        // the fact leaves a window — however short — in which a local user can connect to a
+        // world-accessible socket and be handed a terminal.
+        let listener = {
+            let previous = unsafe { libc::umask(0o117) };
+            let result = UnixListener::bind(&path);
+            unsafe { libc::umask(previous) };
+            result.with_context(|| format!("cannot bind unix socket {}", path.display()))?
+        };
         apply_socket_permissions(&path, cfg)?;
         return Ok(Listener::Unix { listener, path });
     }
@@ -80,14 +90,21 @@ fn resolve_bind_address(cfg: &Config) -> Result<IpAddr> {
         let Some(storage) = entry.address else {
             continue;
         };
+        // `-6` asks for IPv6; falling through to the v4 branch when this particular entry
+        // happens to be v4 would silently ignore it, and an interface's v4 address is
+        // usually enumerated first.
         if cfg.ipv6 {
             if let Some(v6) = storage.as_sockaddr_in6() {
                 return Ok(IpAddr::V6(v6.ip()));
             }
+            continue;
         }
         if let Some(v4) = storage.as_sockaddr_in() {
             return Ok(IpAddr::V4(v4.ip()));
         }
+    }
+    if cfg.ipv6 {
+        bail!("no IPv6 address found for interface {iface}")
     }
     bail!("no address found for interface {iface}")
 }
@@ -100,6 +117,8 @@ fn resolve_bind_address(cfg: &Config) -> Result<IpAddr> {
 /// Without it the socket keeps the process umask, which on a default umask means `0755`:
 /// world-connectable, so any local user on the box gets a terminal. Verified against the C
 /// build by `strace`, which shows `chown` followed by `chmod(path, 0660)` on every start.
+/// The caller also binds under a restrictive umask, so the mode here confirms the result
+/// rather than being the only thing standing between the socket and the rest of the box.
 fn apply_socket_permissions(path: &std::path::Path, cfg: &Config) -> Result<()> {
     let uid = cfg.uid.map(nix::unistd::Uid::from_raw);
     let gid = cfg.gid.map(nix::unistd::Gid::from_raw);
@@ -202,7 +221,13 @@ pub async fn run(
             tokio::select! {
                 _ = state.wait_for_shutdown() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { continue };
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(e) => {
+                            accept_backoff(e).await;
+                            continue;
+                        }
+                    };
                     let router = router.clone();
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
@@ -216,7 +241,13 @@ pub async fn run(
                 tokio::select! {
                     _ = state.wait_for_shutdown() => break,
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { continue };
+                        let stream = match accepted {
+                            Ok((stream, _)) => stream,
+                            Err(e) => {
+                                accept_backoff(e).await;
+                                continue;
+                            }
+                        };
                         let router = router.clone();
                         tokio::spawn(async move {
                             let conn = ConnInfo { peer: None, tls: false };
@@ -228,6 +259,16 @@ pub async fn run(
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Reports a failed `accept` and pauses briefly.
+///
+/// Descriptor exhaustion (`EMFILE`/`ENFILE`) is not transient: `accept` fails immediately
+/// and keeps failing, so retrying without a pause spins a core at 100 % and starves the
+/// runtime that would otherwise be closing the connections which free those descriptors.
+async fn accept_backoff(error: std::io::Error) {
+    tracing::warn!("accept failed: {error}");
+    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
 }
 
 async fn serve_tcp(

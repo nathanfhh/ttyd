@@ -10,6 +10,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 import time
 
 from playwright.sync_api import sync_playwright
@@ -71,6 +72,11 @@ while time.time() < deadline and port is None:
         port = int(m.group(1))
 assert port, "server never reported a port"
 print(f"  server on port {port}")
+
+# Keep draining for the rest of the run. Reading only until the port line lets the log fill
+# the 64 kB pipe buffer, after which the server blocks in write() and looks exactly like a
+# frozen server — the failure PARITY.md records from the first soak attempt.
+threading.Thread(target=lambda: [None for _ in proc.stderr], daemon=True).start()
 
 failures = []
 
