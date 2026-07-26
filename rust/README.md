@@ -128,6 +128,21 @@ managed launch can fail even though a usable Chromium is installed, in which cas
 script falls back to one found under `PLAYWRIGHT_BROWSERS_PATH` and says so; set
 `TTYD_CHROMIUM=/path/to/chrome` to choose the binary yourself.
 
+`browser-check.py` proves the frontend works; it does not prove a terminal survives being
+left open. `e2e-soak.py` holds one real browser session for twenty minutes under concurrent
+load, asking it every thirty seconds to run a command and prove the shell executed it, and
+samples the server throughout:
+
+```sh
+python3 e2e-soak.py                          # 20 minutes, the default
+python3 e2e-soak.py ./target/release/ttyd 300  # or a shorter run
+```
+
+It fails if the session ever stops working, if the browser sees a WebSocket close, or if the
+server's descriptors or threads grow. Because every probe records the shell's own PID, a
+silent reconnect — which looks identical on screen, since the frontend reconnects by itself —
+shows up as a changed PID rather than passing unnoticed.
+
 ## Compatibility
 
 Every command-line option, HTTP endpoint, WebSocket message type and authentication mode of
