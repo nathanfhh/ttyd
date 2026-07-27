@@ -8,9 +8,9 @@ verified by their *effect* (files the shell creates), and rendering from a scree
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -20,14 +20,14 @@ REPO = pathlib.Path(__file__).resolve().parent
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else str(REPO / "target" / "release" / "ttyd")
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "rust"
-WORK = pathlib.Path(f"/tmp/ttyd-browser-{LABEL}")
-# Each run starts from an empty directory, so nothing a previous run left behind (a vim
-# swap file, a stale marker) can change what this one observes.
-
-# rmtree rather than unlinking entries: anything that ever leaves a directory behind — a
-# browser profile, an openssl scratch dir — would make `unlink` raise instead of cleaning up.
-shutil.rmtree(WORK, ignore_errors=True)
-WORK.mkdir(parents=True)
+# A fresh directory per run, so nothing a previous run left behind (a vim swap file, a
+# stale marker) can change what this one observes.
+#
+# mkdtemp rather than a name derived from LABEL: a fixed path meant two copies of this
+# script running at once — the same label under a test runner, or a rerun started before
+# the last one exited — would clear each other's directory mid-run and fail in a way that
+# looks like a product bug. It is left behind on exit so a failure can be inspected.
+WORK = pathlib.Path(tempfile.mkdtemp(prefix=f"ttyd-browser-{LABEL}-"))
 
 IS_C = LABEL == "c"
 USE_TLS = os.environ.get("TTYD_BROWSER_TLS") == "1"
@@ -201,7 +201,7 @@ with sync_playwright() as pw:
     # Something on screen worth looking at: colour, CJK, box drawing.
     run("printf '\\033[1;32mCOLOUR-OK\\033[0m 中文測試 CJK ┌───┐\\n'")
     time.sleep(1.5)
-    page.screenshot(path=f"/tmp/ttyd-{LABEL}.png")
+    page.screenshot(path=str(WORK / "terminal.png"))
 
     # A full-screen program exercises the alternate screen and escape sequences.
     vi_file = WORK / "vi-check.txt"
@@ -209,7 +209,7 @@ with sync_playwright() as pw:
     time.sleep(4)
     page.keyboard.type("iVI-ALT-SCREEN-OK")
     time.sleep(1.5)
-    page.screenshot(path=f"/tmp/ttyd-{LABEL}-vi.png")
+    page.screenshot(path=str(WORK / "terminal-vi.png"))
     page.keyboard.press("Escape")
     time.sleep(0.3)
     run(f":wq {WORK}/vi-out")
@@ -234,7 +234,7 @@ except subprocess.TimeoutExpired:
     proc.kill()
     proc.wait(timeout=5)
 
-print(f"  screenshots: /tmp/ttyd-{LABEL}.png, /tmp/ttyd-{LABEL}-vi.png")
+print(f"  work dir (screenshots, markers): {WORK}")
 if USE_TLS:
     print("  (TLS pass)")
 print(f"\n  {LABEL}: {'ALL PASSED' if not failures else 'FAILED: ' + ', '.join(failures)}")

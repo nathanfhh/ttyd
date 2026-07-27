@@ -629,7 +629,10 @@ fn parse_inner(args: &[String]) -> Result<Outcome, i32> {
                 let path = PathBuf::from(&expanded);
                 match std::fs::metadata(&path) {
                     Err(e) => {
-                        eprintln!("Can not stat index.html: {expanded}, error: {e}");
+                        eprintln!(
+                            "Can not stat index.html: {expanded}, error: {}",
+                            crate::utils::strerror(&e)
+                        );
                         return Err(255);
                     }
                     Ok(meta) if meta.is_dir() => {

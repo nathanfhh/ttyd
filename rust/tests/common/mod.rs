@@ -25,8 +25,31 @@ pub fn binary() -> String {
 
 /// True when the suite is running against the original C implementation, which lacks the
 /// features this port adds.
+///
+/// Asked of the binary rather than of a second environment variable. `TTYD_REFERENCE` and
+/// `TTYD_BIN` used to have to be set together, and setting only `TTYD_BIN` — which the module
+/// docs above describe as the way to run against the C build — left the guards believing they
+/// were on the Rust build. The tests that then passed a port-only option to the C binary got
+/// getopt's "unrecognized option" warning and a *server*, because that is what the C build
+/// does with an option it does not know: complains and starts anyway. `run_cli` waited for a
+/// process that would never exit, and the whole suite hung with no output.
+///
+/// `TTYD_REFERENCE` still forces the answer, for a build whose `--help` cannot be trusted.
 pub fn is_c_reference() -> bool {
-    std::env::var("TTYD_REFERENCE").is_ok()
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if std::env::var("TTYD_REFERENCE").is_ok() {
+            return true;
+        }
+        // `--auth-url` is added by this port, so its absence from the help text identifies
+        // the reference build without hard-coding anything about where it lives on disk.
+        let Ok(out) = Command::new(binary()).arg("--help").output() else {
+            return false;
+        };
+        let help = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        !help.contains("--auth-url")
+    })
 }
 
 /// A running ttyd process, torn down when the value is dropped.
@@ -256,16 +279,66 @@ pub struct RunResult {
     pub stderr: String,
 }
 
+/// How long `run_cli` waits for a binary that is supposed to exit on its own.
+///
+/// These tests all pass arguments that should make ttyd print a diagnostic and stop. When one
+/// of them starts a server instead, `Command::output()` blocks forever and takes the suite
+/// with it — silently, since a hung test prints nothing. Bounding the wait converts that into
+/// a named failure with the captured output attached.
+const CLI_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn run_cli(args: &[&str]) -> RunResult {
-    let output = Command::new(binary())
+    let mut child = Command::new(binary())
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("cannot run ttyd");
+
+    // Drained on threads: a process killed at the deadline may already have filled a pipe
+    // buffer, and reading only after the kill would deadlock against a writer blocked in
+    // write(). This is the same undrained-pipe failure the soak harness hit.
+    let mut out = child.stdout.take().expect("piped");
+    let mut err = child.stderr.take().expect("piped");
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().expect("cannot poll ttyd") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out_thread.join().expect("stdout drain")).into_owned();
+    let stderr = String::from_utf8_lossy(&err_thread.join().expect("stderr drain")).into_owned();
+    assert!(
+        !timed_out,
+        "ttyd {args:?} did not exit within {CLI_TIMEOUT:?} — it started a server instead.\n\
+         stdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+
     RunResult {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout,
+        stderr,
     }
 }
 

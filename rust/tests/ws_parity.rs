@@ -58,6 +58,12 @@ async fn open_session(ws: &mut WsStream, columns: u16, rows: u16) -> (String, St
 /// `echo x > file` creates the directory entry and writes to it as separate syscalls, so a
 /// loop that only checks `exists()` can read the empty file in between and assert against a
 /// truncated string. Guarding on length is what `e2e-soak.py` already does.
+///
+/// The blocking `std::fs` read is deliberate. `#[tokio::test]` builds a current-thread
+/// runtime, so there is no other task on the worker to starve, and `tokio::fs` would answer
+/// a microsecond-long read of a tiny local file by dispatching it to the blocking pool and
+/// waiting for it to come back — more machinery, more latency, for a loop that then sleeps
+/// 100 ms anyway.
 async fn wait_for_content(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {

@@ -56,6 +56,27 @@ pub fn get_sig(name: &str) -> i32 {
     digits.parse().unwrap_or(0)
 }
 
+/// `strerror(errno)` as C prints it.
+///
+/// `io::Error`'s own `Display` appends the numeric code — "No such file or directory (os
+/// error 2)" — which is friendlier but is not what the C build writes. Diagnostics that
+/// reproduce a C message verbatim have to go through this instead of `{e}`.
+pub fn strerror(e: &std::io::Error) -> String {
+    let Some(code) = e.raw_os_error() else {
+        return e.to_string();
+    };
+    let mut buf = vec![0u8; 256];
+    // Safety: XSI strerror_r writes at most buf.len() bytes and NUL-terminates. On failure it
+    // returns non-zero and the buffer contents are unspecified, which is why that path falls
+    // back rather than reading the buffer.
+    let rc = unsafe { libc::strerror_r(code, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return e.to_string();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
 /// The machine's host name, used in the terminal window title.
 pub fn hostname() -> String {
     let mut buf = vec![0u8; 256];

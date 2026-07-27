@@ -113,7 +113,11 @@ async fn index(State(state): State<Arc<AppState>>, request: Request) -> Response
                 // The reason is logged so an operator can tell a permission problem from a
                 // missing file, which the status code alone does not say.
                 tracing::error!("cannot read custom index {}: {e}", path.display());
-                not_found(request).await
+                // `not_found_response`, not the `not_found` handler: the C build logs access
+                // exactly once, at the top of `LWS_CALLBACK_HTTP`, before it decides what to
+                // serve. Delegating to the handler logged the request a second time on the way
+                // out, so a vanished index file produced two `HTTP /` lines for one request.
+                not_found_response()
             }
         };
     }
@@ -156,6 +160,11 @@ const NOT_FOUND_BODY: &str = "<html><head><meta charset=utf-8 http-equiv=\"Conte
 
 async fn not_found(request: Request) -> Response {
     log_access(&request);
+    not_found_response()
+}
+
+/// The 404 itself, with no access logging, for callers that have already logged.
+fn not_found_response() -> Response {
     (
         StatusCode::NOT_FOUND,
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))],
