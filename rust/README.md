@@ -143,6 +143,19 @@ server's descriptors or threads grow. Because every probe records the shell's ow
 silent reconnect — which looks identical on screen, since the frontend reconnects by itself —
 shows up as a changed PID rather than passing unnoticed.
 
+`bench.py` produces the performance table in `PARITY.md`, running both builds interleaved so
+machine drift lands on both. It refuses to start on a machine that already has load generators
+running, sweeps for any it orphans, and reports the count — a benchmark that becomes its own
+load is the failure this harness is built to make visible:
+
+```sh
+python3 bench.py        # 5 rounds, the default
+python3 bench.py 1      # a quick check
+```
+
+It expects the C reference at `../build-c/ttyd`; override with `TTYD_C_BIN` and
+`TTYD_RUST_BIN`.
+
 ## Supply chain
 
 ```sh

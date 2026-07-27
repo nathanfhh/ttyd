@@ -417,20 +417,36 @@ machine drift lands on both instead of on whichever went second. Each figure is 
 five rounds on an otherwise idle 4-core machine, and the full per-round range is shown for
 every row, because a difference smaller than the spread is not a difference.
 
+The harness is `bench.py`, committed alongside this file so the table can be re-run rather
+than taken on trust.
+
 | Measurement | C (median) | C range | Rust (median) | Rust range | Verdict |
 |---|---|---|---|---|---|
-| startup to listening (ms) | 4.2 | 3.8–5.5 | **2.8** | 2.6–3.0 | Rust, ranges disjoint |
-| baseline RSS (kB) | 5048 | 5028–5052 | 5276 | 5092–5300 | C, but by 4 % |
-| **RSS per idle session (kB)** | **17.3** | 17.1–17.3 | 204.8 | 204.0–209.9 | **C, 12×** |
-| HTTP `/token` (req/s) | 3546 | 3243–4028 | 4621 | 3780–4693 | ranges overlap — no call |
-| terminal sessions (open+close/s) | 321 | 290–370 | **660** | 425–824 | Rust, ranges disjoint |
-| terminal output (MB/s) | 63.1 | 56.6–64.7 | **75.6** | 73.6–82.9 | Rust, ranges disjoint |
-| CPU per MB delivered (ms) | 12.2 | 11.2–12.8 | 11.8 | 10.7–12.4 | ranges overlap — equal |
+| startup to listening (ms) | 4.3 | 4.0–5.6 | **2.7** | 2.6–2.9 | Rust, ranges disjoint |
+| baseline RSS (kB) | **5108** | 5068–5116 | 5256 | 5196–5280 | C, but by 3 % |
+| **RSS per idle session (kB)** | **17.3** | 17.3–17.4 | 82.7 | 80.3–83.2 | **C, 4.8×** |
+| HTTP `/token` (req/s) | 4582 | 3886–4786 | 4862 | 4402–5147 | ranges overlap — no call |
+| terminal sessions (open+close/s) | 163 | 152–173 | **195** | 179–206 | Rust, ranges disjoint |
+| terminal output (MB/s) | 76.7 | 47.9–83.6 | **92.3** | 85.8–92.8 | Rust, ranges disjoint |
+| CPU per MB delivered (ms) | 8.6 | 8.4–9.2 | 8.5 | 8.1–9.0 | ranges overlap — equal |
 
 Two rows deliberately draw no conclusion. The request-rate figure is produced by a Python
 client that is itself the bottleneck, and its ranges overlap besides; CPU per byte is a real
 measurement read from `/proc`, and it is genuinely a tie. Only the four rows with disjoint
 ranges support a claim.
+
+**Read the magnitudes as a floor, not as the machine's best.** A full round costs both builds
+throughput, and it compounds: run `session_rate` on its own, three times in a row, and it holds
+steady at 376–416/s for C and 762–870/s for this port; run it as step five of seven in a
+five-round sweep and the medians fall to 163 and 195. Both builds are depressed together — the
+ratio moves much less than the absolute figures — which is exactly what interleaving is for,
+and it is why every row here carries its spread. What accumulates has not been identified: it
+is not leaked shells (`ps` shows none after 500 sessions on either build) and not lingering
+`TIME_WAIT` sockets (five, at rest). It is listed here as an open question rather than left for
+a reader to trip over.
+
+Absolute numbers are therefore not comparable with an earlier revision of this table, which in
+addition was measured with a harness that was quietly loading the machine (below).
 
 An earlier revision of this table read very differently: throughput was within the noise and
 the C build used 23 % less CPU per byte delivered. That was measured before the PTY stopped
@@ -445,7 +461,7 @@ client count was scheduler pressure rather than useful work.
 traced rather than assumed. Both explanations turned out to be about *idle time*, not about
 Rust generating better code.
 
-**Terminal output (75.6 vs 63.1 MB/s).** Per-byte cost is a tie, and CPU utilisation is what
+**Terminal output (92.3 vs 76.7 MB/s).** Per-byte cost is a tie, and CPU utilisation is what
 differs. On the same 4-core box, delivering the same generated stream:
 
 | | throughput | server CPU | %CPU per MB/s |
@@ -472,7 +488,7 @@ looked like it should cost two `epoll_ctl` syscalls each time. The trace shows *
 before the next loop iteration. The cost of the ping-pong is the extra loop turn, not the
 re-arming.
 
-**Session churn (660 vs 321 open+close/s).** Measured directly: idle → ten concurrent
+**Session churn (195 vs 163 open+close/s).** Measured directly: idle → ten concurrent
 sessions, C goes from 2 threads to 12, this port stays at 5. C creates a real pthread per
 session for a blocking `waitpid` (`uv_thread_create(&process->tid, wait_cb, process)` in
 `pty_spawn`) and `uv_thread_join`s it in `process_free`. So every session pays a `clone`, a
@@ -481,12 +497,40 @@ symmetry with the defect this port shipped and fixed: the first version used *th
 threads per session and was slower than C on both rows. Reducing C's one to zero is the same
 lever, applied one notch further.
 
-A methodology note, recorded because it nearly went unnoticed: the first run of this table
-was taken while an eight-minute browser soak was running on the same machine. The numbers
-happened to survive a clean re-run, but they should not have been reported. These figures
-come from a run with nothing else scheduled.
+### Two ways this table was wrong before it was right
 
-**C still wins on memory per session, but the gap is now 5.5×, not 12×.** The dominant cost
+Both are recorded because both produced numbers that looked entirely plausible.
+
+**The harness was the load.** `bench.py` terminated each server with SIGTERM and escalated to
+SIGKILL after ten seconds. Both builds reap the terminal's process tree on SIGTERM — measured,
+in about 0.01 s — but a SIGKILLed server never runs that path, and `-W sh -c 'while true; …'`
+leaves a `dd | tr` loop spinning with no parent to kill it. Each orphan added load, load slowed
+the next shutdown, a slower shutdown hit the escalation. A five-round run finished with
+**twenty-six generators still running and a load average of 33 on a four-core box**, and its
+output degraded across rounds in a way that reads as a result: C's terminal-output row spread
+from 12.2 to 71.5 MB/s and its session rate halved.
+
+Signalling the server's process group does not fix this, which is worth stating because it is
+the obvious first attempt. ttyd gives the terminal its own session — `setsid` plus `TIOCSCTTY`,
+exactly right for a terminal server — so the shell is not in the server's group and no signal
+aimed at that group reaches it. The harness now sweeps for surviving generators after every
+server, waits three seconds first so a still-exiting process is not miscounted as a leak,
+refuses to start on a machine that already has some, and prints how many it had to reap.
+
+One claim is deliberately *not* made: with the sweep in place, the SIGKILL escalation stops
+firing entirely, and orphans still appear — around four per round, only after the machine has
+been working, never in an isolated run of the same two measurements. So the escalation is one
+way to produce them and not the only one, and the second path is unidentified. What the table
+can say is that the run behind it swept its own strays and ended with none outstanding.
+
+**A benchmark was run against a busy machine.** The first version of this table was taken
+while an eight-minute browser soak ran alongside it. Those numbers happened to survive a clean
+re-run, but they should not have been published.
+
+The shape of both mistakes is the same: a measurement that silently includes the measurer.
+That is why the harness now asserts rather than assumes, and why it is in the repository.
+
+**C still wins on memory per session, but the gap is now 4.8×, not 12×.** The dominant cost
 was found and removed.
 
 Decomposing per-connection RSS before and after:
@@ -506,6 +550,12 @@ knobs and only the read one is eager.) The read buffer carries client-to-server 
 keystrokes, resize messages, the opening frame — so it is sized to 16 KiB, and a larger paste
 still works because `BytesMut` grows on demand, verified by echoing a 1 MB single frame back
 through `cat` on both builds.
+
+This decomposition and the table's 82.7 kB/session are measuring different things and do not
+have to agree: the numbers above are one connection's own mappings, read from `smaps`, while
+the table divides the resident growth across twenty-five simultaneous sessions. The marginal
+session is cheaper than the first because the allocator reuses arenas it has already faulted
+in, which is why the amortised figure lands below the single-connection one.
 
 What remains is the ~64 kB every connection costs before it is even a WebSocket — hyper's own
 per-connection buffers. That is a smaller target, it is load-bearing for HTTP throughput, and
