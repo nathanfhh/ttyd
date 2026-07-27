@@ -186,3 +186,24 @@ comparison is constant time — each explained in [PARITY.md](PARITY.md). `--tit
 **Windows is not ported.** The C build supports it through ConPTY; this port implements the
 Unix PTY path only. A Windows backend fits behind the same `pty` module interface and was
 left out rather than shipped untested.
+
+## Versioning
+
+This port continues the C project's version line instead of restarting at `0.1.0`. It is the
+same program to anyone using it — same options, same wire protocol, same frontend bundle — so
+a fresh numbering would tell an operator nothing useful and would lose the fact that this
+follows 1.7.7.
+
+**It starts at 2.0.0.** Not 1.8.0: a reimplementation in a different language is the largest
+change a user can be handed even when every observable behaviour is preserved, and the
+platform support genuinely narrowed, since the C build runs on Windows and this one does not.
+Under semver, dropping a supported platform is breaking on its own.
+
+`--version` therefore reports `2.0.0-<short git hash>` where the C build reports
+`1.7.7-<short git hash>`. The format is deliberately identical and the number deliberately
+is not: a binary found in the wild should never be ambiguous about which implementation it is.
+Version numbers do not travel between the two builds, and nothing in the test suite compares
+them — the differential tests compare *behaviour*, which is the thing that is supposed to
+match.
+
+Releases are tagged with the bare version, `2.0.0`, matching how the C project tags its own.

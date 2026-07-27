@@ -1,6 +1,12 @@
 [package]
 name = "ttyd"
-version = "1.7.7"
+# Continues the C project's version line rather than restarting at 0.1.0, because this is the
+# same program: same options, same wire protocol, same frontend bundle. 2.0.0 rather than
+# 1.8.0 because a reimplementation in another language is the largest change a user can be
+# handed, and because the platform support genuinely narrowed — the C build runs on Windows
+# via ConPTY and this one does not. Under semver that is breaking regardless of how faithful
+# the rest is. See "Versioning" in README.md.
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.86"
 description = "Share your terminal over the web"

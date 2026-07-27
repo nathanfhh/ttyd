@@ -31,8 +31,12 @@ fn main() {
     .expect("write html_meta.rs");
 }
 
-/// Reproduces the CMake version scheme, `<crate version>-<short git hash>`, so that
-/// `ttyd --version` matches what the C build reports for the same commit.
+/// Reproduces the CMake version *scheme*, `<crate version>-<short git hash>`, so `--version`
+/// is readable the same way on both builds and still identifies the exact commit.
+///
+/// The number itself deliberately differs — this crate is 2.x where the C build is 1.7.x — so
+/// that a binary in the wild is never ambiguous about which implementation it is. Anything
+/// comparing the two builds should compare behaviour, not this string.
 fn emit_version(manifest_dir: &Path) {
     let base = env::var("CARGO_PKG_VERSION").unwrap();
     let hash = std::process::Command::new("git")

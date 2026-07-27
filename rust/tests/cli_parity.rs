@@ -1,7 +1,9 @@
 //! Command-line behaviour: exit codes, diagnostics and the help/version output.
 //!
-//! Run against the C build with `TTYD_BIN=... TTYD_REFERENCE=1 cargo test` to confirm the
-//! port reproduces the original behaviour.
+//! Run against the C build with `TTYD_BIN=../build-c/ttyd cargo test` to confirm the port
+//! reproduces the original behaviour. `TTYD_REFERENCE=1` is no longer needed — the harness
+//! asks the binary which implementation it is — and setting only one of the two is what used
+//! to hang the whole suite.
 
 mod common;
 
