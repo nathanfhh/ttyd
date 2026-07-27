@@ -439,6 +439,48 @@ entry below) did not only reduce memory; it moved throughput and CPU efficiency 
 ahead" to "Rust is ahead or equal", because three threads per session multiplied by the
 client count was scheduler pressure rather than useful work.
 
+### Why the throughput rows go the way they do
+
+"Rust is faster" is not a result until the mechanism is known, so the two disjoint rows were
+traced rather than assumed. Both explanations turned out to be about *idle time*, not about
+Rust generating better code.
+
+**Terminal output (75.6 vs 63.1 MB/s).** Per-byte cost is a tie, and CPU utilisation is what
+differs. On the same 4-core box, delivering the same generated stream:
+
+| | throughput | server CPU | %CPU per MB/s |
+|---|---|---|---|
+| C | 78.3 MB/s | 79.5 %, all on one thread | 1.02 |
+| Rust | 93.4 MB/s | 89.7 %, spread over four workers at ≤30 % each | 0.96 |
+
+The revealing number is C's **79 %**. Its single event-loop thread is not saturated — it is
+idle a fifth of the time — so nothing about the client or the generator is capping it. The
+idle is structural. `read_cb` in `src/pty.c` calls `uv_read_stop` on its first line, parks the
+chunk in `pss->pty_buf`, and only calls `pty_resume` after `lws_write` has returned inside the
+writable callback. Exactly one chunk is ever in flight: while the socket write happens, the
+PTY is not being read, and vice versa. `strace -c` confirms the shape — C spends **2.0
+`epoll_pwait` per PTY read** (506 vs 253 per MB), i.e. two full event-loop turns per chunk.
+
+This port reads the PTY in its own task feeding a depth-1 `mpsc`, so chunk *N+1* is being read
+while chunk *N* is being framed and written. Same trace: **1.15 `epoll_wait` per read** (294 vs
+256 per MB). The overlap is the entire win. It is not free — the cross-thread handoff shows up
+as 228 `futex` per MB, which is precisely why per-byte CPU comes out a tie instead of a win.
+
+An earlier guess, recorded because it was wrong: `uv_read_stop`/`uv_read_start` per chunk
+looked like it should cost two `epoll_ctl` syscalls each time. The trace shows **zero**
+`epoll_ctl` on either build — libuv coalesces the stop and the start in its watcher queue
+before the next loop iteration. The cost of the ping-pong is the extra loop turn, not the
+re-arming.
+
+**Session churn (660 vs 321 open+close/s).** Measured directly: idle → ten concurrent
+sessions, C goes from 2 threads to 12, this port stays at 5. C creates a real pthread per
+session for a blocking `waitpid` (`uv_thread_create(&process->tid, wait_cb, process)` in
+`pty_spawn`) and `uv_thread_join`s it in `process_free`. So every session pays a `clone`, a
+stack mapping and a join handshake. This port spawns three tokio tasks instead. Note the
+symmetry with the defect this port shipped and fixed: the first version used *three* OS
+threads per session and was slower than C on both rows. Reducing C's one to zero is the same
+lever, applied one notch further.
+
 A methodology note, recorded because it nearly went unnoticed: the first run of this table
 was taken while an eight-minute browser soak was running on the same machine. The numbers
 happened to survive a clean re-run, but they should not have been reported. These figures
