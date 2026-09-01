@@ -1,5 +1,7 @@
 # Parity report: C implementation vs. Rust port
 
+[繁體中文](PARITY.zh-TW.md) | **English**
+
 This document records how the Rust port was validated against the original C
 implementation, what the validation found, and where the two deliberately differ.
 
