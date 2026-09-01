@@ -45,13 +45,13 @@ have, so no shared test can reach it by construction; it is covered instead by t
 `forward_auth` tests, which have nothing to run against. Excluding it closes the gap to
 about two points. The rest is that this port carries close to three times the code of the
 original by the same counting — 2778 instrumented lines against 966 — some of it error
-handling with no C equivalent. By raw line count the ratio is smaller, 4628 against 1965.
+handling with no C equivalent. By raw line count the ratio is smaller, 4631 against 1965.
 
 The last row is the number to use when asking "how much of this port is tested at all",
 and the one that should *not* be set beside the C figure.
 
 These four figures were measured at `bfa0d05`, where the suite stood at 221 tests and the
-port at 4409 lines; it has since gained one unit test and grown to 4628. The C figure is
+port at 4409 lines; it has since gained one unit test and grown to 4631. The C figure is
 unaffected, because `src/*.c` has not changed since the fork. The inventory below is the
 current count, not the one behind the percentages.
 
@@ -348,7 +348,7 @@ approach above was blind.
   absolute-form requests, and a request with neither is answered `400 Bad Request` instead.
   (The C build drops the connection without answering at all.)
 - **Terminal input was queued without limit.** A child that is slow to read, or not reading
-  at all, fills the kernel PTY buffer and blocks the writer thread; everything the client
+  at all, fills the kernel PTY buffer and stops the write completing; everything the client
   kept sending piled up in the server's memory. Measured: 15 MiB of input aimed at a
   non-reading child grew RSS by 6.5 MB with nothing to stop it, while the C build absorbed
   179 MiB for under 1 MB of growth because libwebsockets applies read flow control. The

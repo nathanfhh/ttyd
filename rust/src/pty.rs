@@ -29,9 +29,12 @@ use tokio::sync::{mpsc, oneshot};
 /// reading from its client.
 ///
 /// A child that is slow to read — or not reading at all — lets the kernel PTY buffer fill,
-/// after which the writer thread blocks in `write`. Everything the client keeps sending
-/// piles up in front of it, so without a ceiling one authenticated writable client can grow
-/// the *server's* memory without bound, and `--max-clients` multiplies that. Reaching the
+/// after which `pump_input` stops being able to place bytes there. Everything the client
+/// keeps sending piles up in front of it, so without a ceiling one authenticated writable
+/// client can grow the *server's* memory without bound, and `--max-clients` multiplies that.
+/// (Some kernels, the BSDs among them, discard the excess in canonical mode rather than
+/// refusing the write, in which case nothing queues and the ceiling is never reached.)
+/// Reaching the
 /// ceiling stops the session reading its socket until the child catches up, which pushes
 /// back through TCP instead of dropping input or dropping the client.
 pub const MAX_QUEUED_INPUT: usize = 4 * 1024 * 1024;
@@ -191,8 +194,8 @@ impl Pty {
         self.queued_input.fetch_add(len, Ordering::AcqRel);
         if self.writer.send(data).is_err() {
             // Nothing will ever write these bytes, so they must not stay counted. Saturating
-            // because the writer thread zeroes the counter on its way out, and this can lose
-            // the race with it — going negative would wrap and pin the backlog full forever.
+            // because `pump_input` zeroes the counter on its way out, and this can lose the
+            // race with it — going negative would wrap and pin the backlog full forever.
             let _ = self
                 .queued_input
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {

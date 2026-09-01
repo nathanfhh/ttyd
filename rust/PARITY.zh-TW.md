@@ -27,11 +27,11 @@
 | Rust 移植版，不含 `auth.rs` | 同一組 108 支共用相容性測試 | **86.55 %** |
 | Rust 移植版（2778 行） | 整套測試，含單元測試與 forward-auth | **93.82 %** |
 
-可以互相比較的是前兩列，而結果並不偏袒這個移植版：共用測試觸及的 Rust 程式碼比例**低於** C 程式碼。差距大多來自 `auth.rs`，也就是 forward authentication；C 版沒有這項功能，因此共用測試本來就不可能跑到它。這部分改由 19 支沒有 C 版對照組的 `forward_auth` 測試覆蓋。排除 `auth.rs` 後，差距縮小至約兩個百分點。其餘差距則是因為以同一套計數方式看，移植版的程式碼量接近原版的三倍——2778 行對 966 行——其中一部分是 C 版沒有對應內容的錯誤處理。若改以原始行數計算，比例較小，是 4628 行對 1965 行。
+可以互相比較的是前兩列，而結果並不偏袒這個移植版：共用測試觸及的 Rust 程式碼比例**低於** C 程式碼。差距大多來自 `auth.rs`，也就是 forward authentication；C 版沒有這項功能，因此共用測試本來就不可能跑到它。這部分改由 19 支沒有 C 版對照組的 `forward_auth` 測試覆蓋。排除 `auth.rs` 後，差距縮小至約兩個百分點。其餘差距則是因為以同一套計數方式看，移植版的程式碼量接近原版的三倍——2778 行對 966 行——其中一部分是 C 版沒有對應內容的錯誤處理。若改以原始行數計算，比例較小，是 4631 行對 1965 行。
 
 最後一列適合回答「這個移植版整體有多少程式碼至少被測過」，但**不應**拿來與 C 版數字並列比較。
 
-這四個數字量測於 `bfa0d05`，當時測試套件是 221 支、移植版是 4409 行；之後套件多了一支單元測試，程式碼也長到 4628 行。C 版的數字不受影響，因為 `src/*.c` 自 fork 以來沒有變動。下方清單是目前的計數，不是產生上述百分比的那一組。
+這四個數字量測於 `bfa0d05`，當時測試套件是 221 支、移植版是 4409 行；之後套件多了一支單元測試，程式碼也長到 4631 行。C 版的數字不受影響，因為 `src/*.c` 自 fork 以來沒有變動。下方清單是目前的計數，不是產生上述百分比的那一組。
 
 測試清單：
 
@@ -154,7 +154,7 @@ C 版的 `-U daemon:daemon` 能正常運作，socket 最後會是 `srw-rw---- 1 
 - **在 `-d 0` 下看不到 fatal error。**Startup failure path 使用 `tracing::error!`，但 `-d 0` 不會安裝 subscriber，因此 process 會毫無訊息地以 1 結束。現在會直接寫入 stderr。
 - **`--check-origin` 接受 C 版拒絕的 origin，也拒絕 C 版接受的 origin。**`check_host_origin` 不論 scheme 為何都會從 origin 移除 `:80` 與 `:443`，並且對 scheme 本身做區分大小寫的 exact match。移植版原本只移除 scheme 自己的 default port，所以 `https://host:80` 對 `Host: host` 會被拒絕，而 C 版會接受；同時移植版比對前會把 scheme 轉為小寫，所以 C 版會拒絕的 `HTTP://` 甚至 `ftp://` 反而被接受。後半部尤其重要：安全控制比參考實作**更寬鬆**，是錯誤的差異方向。兩者現在由會對兩個 binary 執行的測試固定，涵蓋人工比較過的 17 種 origin 形式。
 - **HTTPS redirect 可能產生 client 無法使用的 URL。**沒有可用 authority 的 request——例如不要求 `Host` 的 HTTP/1.0——會產生 `Location: https:///token`。現在 authority 優先取自 `Host`；HTTP/2 與 absolute-form request 則 fallback 到 URI 自身的 authority；兩者都沒有時改回 `400 Bad Request`。（C 版會直接斷線，不回覆任何內容。）
-- **Terminal input 可以無上限排隊。**Child 讀取緩慢或完全不讀時，kernel PTY buffer 會填滿並阻塞 writer thread，client 後續持續送出的所有內容都堆在 server memory。實測：向不讀取的 child 送 15 MiB input，RSS 增加 6.5 MB，沒有任何限制；C 版因 libwebsockets 套用 read flow control，吸收 179 MiB 後成長仍不到 1 MB。現在 session 在 outstanding data 達 4 MiB 後停止讀取 socket，讓 backlog 由 TCP backpressure 限制，而非記憶體。刻意採用 read gating 而不是在讀取內等待，因為 session 以同一個 `select!` 驅動雙向流量；若在其中等待，也會停止排出 child output，讓同時讀寫的 child 自我卡死。這不是假設：第一版修正確實採取阻塞方式，使用 `cat` 的測試也正因此 deadlock。
+- **Terminal input 可以無上限排隊。**Child 讀取緩慢或完全不讀時，kernel PTY buffer 會填滿，寫入無法完成，client 後續持續送出的所有內容都堆在 server memory。實測：向不讀取的 child 送 15 MiB input，RSS 增加 6.5 MB，沒有任何限制；C 版因 libwebsockets 套用 read flow control，吸收 179 MiB 後成長仍不到 1 MB。現在 session 在 outstanding data 達 4 MiB 後停止讀取 socket，讓 backlog 由 TCP backpressure 限制，而非記憶體。刻意採用 read gating 而不是在讀取內等待，因為 session 以同一個 `select!` 驅動雙向流量；若在其中等待，也會停止排出 child output，讓同時讀寫的 child 自我卡死。這不是假設：第一版修正確實採取阻塞方式，使用 `cat` 的測試也正因此 deadlock。
 - **UNIX domain socket 保留 process umask 決定的權限。**libwebsockets 在 bind 後立刻對它 `chmod 0660`；移植版原本沒有，也略過對 `-u`／`-g` 的 `chown`。這不是任何測試找出的，而是逐行對照 `serve.rs` 與 `server.c`、並對兩個 binary 並列執行 `strace` 時發現。原 socket 測試在 root 下執行，只 assertion `uid == 0`；無論程式有沒有做事都會成立。現在會檢查 mode，並 chown 給不同於測試自身的 user。
 - **一支守護 input backlog 的測試，只在它被寫出來的那台機器上會過。**它繞過 `ws::session` 實際套用的 gate 一路寫下去，並斷言 8 MiB 之內就會撞到上界——那量到的是某台主機的 line discipline 在停止接收前會吞掉多少，而不是這個上界本身。它從 `a827e3d`（PTY 由阻塞 writer thread 改為 readiness 驅動 I/O）開始變紅，之後的十一個 commit、五個星期都紅著沒有被發現，包含這個移植版被合併的那一次。沒有人看的紅燈比缺少測試更糟，因為它照樣被算進測試清單裡。上界本身從未失效：照 gate 的做法模擬，Linux 上 backlog 峰值正好停在 4 MiB；macOS 則根本不會累積，因為該核心是丟棄多餘資料而不是拒絕寫入，實測送出超過 512 MiB 仍沒有任何 outstanding。測試現在改為斷言兩邊都成立的不變量：只要呼叫端在 gate 前停手，排隊量就不會超過上界再加一個 chunk。
 - **Forwarded identity 被默默截斷為 29 bytes**，照搬 C 版的 buffer。影響比表面更嚴重：兩個共享 29-byte prefix 的 account 會被折疊成同一個 `TTYD_USER`。限制現已移除，名稱會完整傳遞。（C 版會直接拒絕這類名稱的 WebSocket upgrade；測試套件現在也會在 C 端 assertion 此行為。）
