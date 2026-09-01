@@ -29,9 +29,12 @@ use tokio::sync::{mpsc, oneshot};
 /// reading from its client.
 ///
 /// A child that is slow to read — or not reading at all — lets the kernel PTY buffer fill,
-/// after which the writer thread blocks in `write`. Everything the client keeps sending
-/// piles up in front of it, so without a ceiling one authenticated writable client can grow
-/// the *server's* memory without bound, and `--max-clients` multiplies that. Reaching the
+/// after which `pump_input` stops being able to place bytes there. Everything the client
+/// keeps sending piles up in front of it, so without a ceiling one authenticated writable
+/// client can grow the *server's* memory without bound, and `--max-clients` multiplies that.
+/// (Some kernels, the BSDs among them, discard the excess in canonical mode rather than
+/// refusing the write, in which case nothing queues and the ceiling is never reached.)
+/// Reaching the
 /// ceiling stops the session reading its socket until the child catches up, which pushes
 /// back through TCP instead of dropping input or dropping the client.
 pub const MAX_QUEUED_INPUT: usize = 4 * 1024 * 1024;
@@ -191,8 +194,8 @@ impl Pty {
         self.queued_input.fetch_add(len, Ordering::AcqRel);
         if self.writer.send(data).is_err() {
             // Nothing will ever write these bytes, so they must not stay counted. Saturating
-            // because the writer thread zeroes the counter on its way out, and this can lose
-            // the race with it — going negative would wrap and pin the backlog full forever.
+            // because `pump_input` zeroes the counter on its way out, and this can lose the
+            // race with it — going negative would wrap and pin the backlog full forever.
             let _ = self
                 .queued_input
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -528,19 +531,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_that_never_reads_makes_its_backlog_report_full() {
-        // `sleep` never reads its terminal, so the kernel PTY buffer fills and the writer
-        // thread blocks. Before the backlog was bounded, every byte sent after that point
-        // was held in the server's memory with nothing to stop it growing.
-        let argv = vec!["/bin/sleep".into(), "60".into()];
+    async fn a_child_that_never_reads_cannot_grow_the_backlog_past_its_ceiling() {
+        // The child never reads its terminal, so the PTY stops accepting and the queue behind
+        // it grows. `ws::session` is expected to stop reading its client once the ceiling is
+        // reached rather than let that queue grow with whatever the client keeps sending,
+        // which is the defect this guards: before the bound existed, everything sent after
+        // that point was held in the server's memory with nothing to stop it.
+        //
+        // The child puts its terminal into raw mode before sleeping. In canonical mode the
+        // BSD line discipline discards input once its buffer is full instead of refusing the
+        // write, so the queue never builds and every assertion below would hold whatever the
+        // ceiling did. Raw mode makes both kernels apply backpressure, which is what gives
+        // this test teeth on more than one platform.
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo; exec sleep 60".into(),
+        ];
         let s = spawn(req(&argv, &[])).expect("spawn");
 
+        // The loop stops at the gate, which is what `ws::session` does: it declines to read
+        // more from its client while the backlog is full. The cap only keeps a regression
+        // from running forever.
         let chunk = vec![b'A'; 64 * 1024];
         let mut sent = 0usize;
-        // The loop is bounded so a regression fails the test rather than running forever.
-        while sent <= MAX_QUEUED_INPUT * 2 && !s.pty.input_backlog_is_full() {
+        let mut peak = 0usize;
+        while sent < 64 * 1024 * 1024 && !s.pty.input_backlog_is_full() {
             assert!(s.pty.write(chunk.clone()), "writer died unexpectedly");
             sent += chunk.len();
+            peak = peak.max(s.pty.queued_input.load(Ordering::Acquire));
             tokio::task::yield_now().await;
         }
 
@@ -548,9 +567,15 @@ mod tests {
             s.pty.input_backlog_is_full(),
             "wrote {sent} bytes to a child that never reads without the backlog filling"
         );
+        // The guarantee is that a caller which stops at the gate never queues more than one
+        // further chunk past the ceiling. An earlier version asserted instead that the
+        // ceiling was reached within 8 MiB, which measures how much the host's line
+        // discipline swallows first rather than this bound; it went red at a827e3d and stayed
+        // red for eleven commits, this port's merge included, without being noticed.
         assert!(
-            sent <= MAX_QUEUED_INPUT + chunk.len(),
-            "backlog reported full only after {sent} bytes, past the {MAX_QUEUED_INPUT} ceiling"
+            peak <= MAX_QUEUED_INPUT + chunk.len(),
+            "a caller stopping at the gate still queued {peak} bytes of the {sent} it sent, \
+             past the {MAX_QUEUED_INPUT} ceiling"
         );
 
         let _ = s.pty.kill(9);

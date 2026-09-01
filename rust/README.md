@@ -1,5 +1,7 @@
 # ttyd — Rust port
 
+[繁體中文](README.zh-TW.md) | **English**
+
 A Rust implementation of [ttyd](https://github.com/tsl0922/ttyd), keeping the command line,
 the HTTP surface and the `tty` WebSocket protocol compatible with the C original, and adding
 **forward authentication** so ttyd can be protected by an existing SSO or auth service
@@ -187,6 +189,9 @@ comparison is constant time — each explained in [PARITY.md](PARITY.md). `--tit
 Unix PTY path only. A Windows backend fits behind the same `pty` module interface and was
 left out rather than shipped untested.
 
+**The Unix path is exercised on Linux and macOS**, with the suite green on both. The BSDs are
+untested.
+
 ## Versioning
 
 This port continues the C project's version line instead of restarting at `0.1.0`. It is the
@@ -199,11 +204,11 @@ change a user can be handed even when every observable behaviour is preserved, a
 platform support genuinely narrowed, since the C build runs on Windows and this one does not.
 Under semver, dropping a supported platform is breaking on its own.
 
-`--version` therefore reports `2.0.0-<short git hash>` where the C build reports
+`--version` therefore reports `2.0.1-<short git hash>` where the C build reports
 `1.7.7-<short git hash>`. The format is deliberately identical and the number deliberately
 is not: a binary found in the wild should never be ambiguous about which implementation it is.
 Version numbers do not travel between the two builds, and nothing in the test suite compares
 them — the differential tests compare *behaviour*, which is the thing that is supposed to
 match.
 
-Releases are tagged with the bare version, `2.0.0`, matching how the C project tags its own.
+Releases are tagged with the bare version, matching how the C project tags its own.

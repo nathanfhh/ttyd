@@ -139,7 +139,7 @@ async fn binding_to_an_explicit_address_works() {
 #[tokio::test]
 async fn binding_to_an_interface_by_name_works() {
     // `-i` accepts a device name as well as an address — the C help documents `eth0`.
-    let server = Server::start(&["-i", "lo", "bash"]);
+    let server = Server::start(&["-i", common::LOOPBACK, "bash"]);
     let response = common::http_client()
         .get(server.http_url("/token"))
         .send()
@@ -180,19 +180,25 @@ async fn the_browser_option_does_not_prevent_serving() {
 #[tokio::test]
 async fn the_browser_option_launches_the_system_opener_with_the_url() {
     // `-B` is otherwise untestable: with no X server both builds decline to launch anything,
-    // so "it did not crash" is all you get. Stubbing `xset` and `xdg-open` onto PATH makes
-    // the launch observable — the stub records the URL it was handed.
+    // so "it did not crash" is all you get. Stubbing the opener onto PATH makes the launch
+    // observable — the stub records the URL it was handed. Which program that is differs by
+    // platform, and so does whether a display probe runs at all, so both come from the same
+    // constants the implementation selects on.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let marker = dir.path().join("opened-url");
 
-    std::fs::write(dir.path().join("xset"), "#!/bin/sh\nexit 0\n").expect("write xset");
+    let mut stubs = vec![common::SYSTEM_OPENER];
+    if cfg!(not(target_os = "macos")) {
+        std::fs::write(dir.path().join("xset"), "#!/bin/sh\nexit 0\n").expect("write xset");
+        stubs.push("xset");
+    }
     std::fs::write(
-        dir.path().join("xdg-open"),
+        dir.path().join(common::SYSTEM_OPENER),
         format!("#!/bin/sh\nprintf '%s' \"$1\" > {}\n", marker.display()),
     )
-    .expect("write xdg-open");
-    for stub in ["xset", "xdg-open"] {
+    .expect("write opener stub");
+    for stub in stubs {
         std::fs::set_permissions(
             dir.path().join(stub),
             std::fs::Permissions::from_mode(0o755),
@@ -638,11 +644,20 @@ async fn socket_metadata_at(socket: &std::path::Path, extra: &[&str]) -> (u32, u
         .spawn()
         .expect("spawn");
 
+    // Waiting for the path to merely exist is not enough: the stale-socket test puts a
+    // regular file there first, so `exists()` is already true and the stat below would read
+    // the leftover rather than the replacement.
+    let is_socket = |p: &std::path::Path| {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(p)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !socket.exists() && std::time::Instant::now() < deadline {
+    while !is_socket(socket) && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(socket.exists(), "the unix socket was never created");
+    assert!(is_socket(socket), "the unix socket was never created");
     // The chown/chmod happen right after bind, but the file appears at bind — give the
     // permission calls a moment rather than racing them.
     tokio::time::sleep(Duration::from_millis(200)).await;

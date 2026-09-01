@@ -7,6 +7,8 @@
 
 # ttyd - Share your terminal over the web
 
+[繁體中文](README.zh-TW.md) | **English**
+
 ttyd is a simple command-line tool for sharing terminal over the web.
 
 ![screenshot](https://github.com/tsl0922/ttyd/raw/main/screenshot.gif)
@@ -137,7 +139,8 @@ cargo test                                 # everything, against this build
 See [rust/README.md](rust/README.md) for the full option reference and
 [rust/PARITY.md](rust/PARITY.md) for what the comparison against the C build found.
 
-Note that Windows is not covered by the Rust port; use the C build there.
+Note that Windows is not covered by the Rust port; use the C build there. The Unix path is
+exercised on both Linux and macOS.
 
 ## Browser Support
 

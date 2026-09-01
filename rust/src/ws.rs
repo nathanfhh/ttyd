@@ -189,7 +189,7 @@ async fn session(
     let mut output_ended = false;
 
     loop {
-        // Nothing else wakes the loop when the only thing that changed is the writer thread
+        // Nothing else wakes the loop when the only thing that changed is `pump_input`
         // draining the backlog, so poll for room while the input branch is gated off.
         let backlog_full = pty.input_backlog_is_full();
         let backlog_recheck = async {

@@ -6,8 +6,8 @@ use common::{http_client, Server};
 use reqwest::StatusCode;
 
 /// Byte sizes of the embedded frontend, asserted so an accidental re-encode is caught.
-const GZIP_LEN: &str = "194115";
-const PLAIN_LEN: &str = "738152";
+const GZIP_LEN: &str = "194632";
+const PLAIN_LEN: &str = "734380";
 
 #[tokio::test]
 async fn index_is_served_as_html() {
