@@ -6,7 +6,7 @@ name = "ttyd"
 # handed, and because the platform support genuinely narrowed — the C build runs on Windows
 # via ConPTY and this one does not. Under semver that is breaking regardless of how faithful
 # the rest is. See "Versioning" in README.md.
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 rust-version = "1.86"
 description = "Share your terminal over the web"
