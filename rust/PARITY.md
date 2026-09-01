@@ -36,24 +36,30 @@ like-for-like pair: the same 108 shared tests, run against each build.
 | C reference (`src/*.c`, 966 lines) | the 108 shared parity tests | **88.72 %** |
 | Rust port (`rust/src/*.rs`) | the same 108 shared parity tests | **80.58 %** |
 | Rust port, excluding `auth.rs` | the same 108 shared parity tests | **86.55 %** |
-| Rust port (2778 lines) | all 221 tests, including unit and forward-auth | **93.82 %** |
+| Rust port (2778 lines) | the whole suite, including unit and forward-auth | **93.82 %** |
 
 The comparable pair is the first two rows, and it does not favour this port: the shared
 suite reaches **less** of the Rust code than of the C code. Most of that gap is
 `auth.rs`, which is forward authentication — a feature the C build does not
 have, so no shared test can reach it by construction; it is covered instead by the 19
 `forward_auth` tests, which have nothing to run against. Excluding it closes the gap to
-about two points. The rest is that this port carries roughly twice the code of the
-original, some of it error handling with no C equivalent.
+about two points. The rest is that this port carries close to three times the code of the
+original by the same counting — 2778 instrumented lines against 966 — some of it error
+handling with no C equivalent. By raw line count the ratio is smaller, 4628 against 1965.
 
 The last row is the number to use when asking "how much of this port is tested at all",
 and the one that should *not* be set beside the C figure.
+
+These four figures were measured at `bfa0d05`, where the suite stood at 221 tests and the
+port at 4409 lines; it has since gained one unit test and grown to 4628. The C figure is
+unaffected, because `src/*.c` has not changed since the fork. The inventory below is the
+current count, not the one behind the percentages.
 
 Test inventory:
 
 | Suite | Tests | Runs against C |
 |---|---|---|
-| Unit tests (`cargo test --lib`) | 94 | no — internal APIs |
+| Unit tests (`cargo test --lib`) | 95 | no — internal APIs |
 | `cli_parity` | 18 | yes |
 | `http_parity` | 21 | yes |
 | `ws_parity` | 37 | yes |
@@ -77,8 +83,10 @@ to `nobody`, so that run contributes nothing to the coverage number.
 
 ## Divergences found
 
-Running the suite against both binaries surfaced four real differences. All four were
-resolved in favour of the Rust behaviour, for the reasons given.
+Running the suite against both binaries surfaced four real differences, each resolved for
+the reasons given below. The first was this port's own defect and was corrected to match C;
+the other three are C defects left as they are there and fixed here, so they remain places
+where the two builds differ.
 
 ### 1. The server used to announce itself before the client did
 
@@ -171,7 +179,7 @@ changes them:
 
 ## Deliberate improvements
 
-Beyond the three divergences, the port makes these changes on purpose:
+Beyond the four divergences above, the port makes these changes on purpose:
 
 - **Basic auth comparison is constant time** (`subtle::ConstantTimeEq`). The C version uses
   `strcmp`, which returns as soon as it finds a differing byte and so leaks how much of a
@@ -356,6 +364,17 @@ approach above was blind.
   binaries side by side, not by any test — the existing socket test asserted `uid == 0` while
   running as root, which is true whether or not anything happened. It now asserts the mode and
   chowns to a user that is not the test's own.
+- **A test guarding the input backlog passed only on the host it was written on.** It wrote
+  straight past the gate `ws::session` applies and asserted the ceiling was reached within
+  8 MiB — which measures how much a host's line discipline swallows before it stops accepting,
+  not the bound itself. It went red at `a827e3d`, where the PTY moved from a blocking writer
+  thread to readiness-driven I/O, and stayed red across the eleven commits that followed,
+  five weeks, this port's merge included, without being noticed. A red test nobody reads is worse than a missing one: it still appears
+  in the inventory. The bound itself was never broken — modelling the gate shows the backlog
+  peaking at exactly 4 MiB on Linux, and on macOS the queue never builds at all, because that
+  kernel discards the excess rather than refusing the write, measured at over 512 MiB sent
+  with nothing outstanding. The test now asserts the invariant that holds on both: a caller
+  that stops at the gate never queues more than one chunk past the ceiling.
 - **The forwarded identity was silently truncated to 29 bytes**, mirroring the C buffer. That
   is worse than it looks: two accounts sharing a 29-byte prefix would collapse onto the same
   `TTYD_USER`. The limit is gone — the name is passed through whole. (The C build refuses the
@@ -369,6 +388,24 @@ so that `setsid`, controlling-terminal acquisition, process-group signalling and
 `128 + signal` exit convention match the original exactly. A Windows backend is a
 self-contained addition behind the same `pty` module interface; it was left out rather
 than shipped untested.
+
+**The Unix path is exercised on Linux and macOS**, and the suite is green on both: 222 tests
+on an arm64 macOS 15.5 host and in a `rust:1.92-slim` container. Getting there took two
+compilation fixes and four test fixes, none of which touched behaviour. `initgroups` takes its
+base group as `gid_t` on Linux and as `int` on Apple platforms, and `setgroups` takes its count
+as `size_t` and `int` respectively, so the port did not compile on macOS at all. Four tests
+carried assumptions about their host rather than about the code: the loopback device is `lo` on
+Linux and `lo0` elsewhere (two tests); the system opener `--browser` invokes is `xdg-open` or
+`open`; the stale-socket test waited for its path to exist, which was already true of the
+leftover file it had just written; and the `-6` fallthrough test named `lo` as an interface
+without an IPv6 address, which is false wherever loopback carries `::1` — it had been failing
+on Linux too, for that reason rather than for the fallthrough it guards.
+
+Two caveats on that green, because a skip and a pass look alike. The `-6` fallthrough test now
+looks for an interface with IPv4 and no IPv6 and skips when the host has none, which on a
+machine that gives every interface a link-local `fe80::` is most of the time; it prints the
+skip rather than passing quietly. And the suite is run by hand: the workflows under
+`.github/` build the C project, and nothing in CI runs `cargo test`. The BSDs are untested.
 
 Everything else in the C feature matrix is implemented and covered: all 30 command-line
 options, the four HTTP endpoints, all eight WebSocket message types, all three
@@ -636,7 +673,7 @@ than as a deletion.
 ## Dependencies
 
 `cargo audit` against the RustSec database (1169 advisories) reports **no vulnerabilities**
-across the 224 crates in `Cargo.lock`. One informational warning: `rustls-pemfile` 2.2.0 is
+across the 222 crates in `Cargo.lock`. One informational warning: `rustls-pemfile` 2.2.0 is
 marked unmaintained (RUSTSEC-2025-0134). It is used only to parse the PEM files named by
 `--ssl-cert`, `--ssl-key` and `--ssl-ca` — operator-supplied local files, not network input.
 

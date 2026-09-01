@@ -25,17 +25,19 @@
 | C 參考版（`src/*.c`，966 行） | 108 支共用相容性測試 | **88.72 %** |
 | Rust 移植版（`rust/src/*.rs`） | 同一組 108 支共用相容性測試 | **80.58 %** |
 | Rust 移植版，不含 `auth.rs` | 同一組 108 支共用相容性測試 | **86.55 %** |
-| Rust 移植版（2778 行） | 全部 221 支測試，含單元測試與 forward-auth | **93.82 %** |
+| Rust 移植版（2778 行） | 整套測試，含單元測試與 forward-auth | **93.82 %** |
 
-可以互相比較的是前兩列，而結果並不偏袒這個移植版：共用測試觸及的 Rust 程式碼比例**低於** C 程式碼。差距大多來自 `auth.rs`，也就是 forward authentication；C 版沒有這項功能，因此共用測試本來就不可能跑到它。這部分改由 19 支沒有 C 版對照組的 `forward_auth` 測試覆蓋。排除 `auth.rs` 後，差距縮小至約兩個百分點。其餘差距則是因為移植版的程式碼量大約是原版兩倍，其中一部分是 C 版沒有對應內容的錯誤處理。
+可以互相比較的是前兩列，而結果並不偏袒這個移植版：共用測試觸及的 Rust 程式碼比例**低於** C 程式碼。差距大多來自 `auth.rs`，也就是 forward authentication；C 版沒有這項功能，因此共用測試本來就不可能跑到它。這部分改由 19 支沒有 C 版對照組的 `forward_auth` 測試覆蓋。排除 `auth.rs` 後，差距縮小至約兩個百分點。其餘差距則是因為以同一套計數方式看，移植版的程式碼量接近原版的三倍——2778 行對 966 行——其中一部分是 C 版沒有對應內容的錯誤處理。若改以原始行數計算，比例較小，是 4628 行對 1965 行。
 
 最後一列適合回答「這個移植版整體有多少程式碼至少被測過」，但**不應**拿來與 C 版數字並列比較。
+
+這四個數字量測於 `bfa0d05`，當時測試套件是 221 支、移植版是 4409 行；之後套件多了一支單元測試，程式碼也長到 4628 行。C 版的數字不受影響，因為 `src/*.c` 自 fork 以來沒有變動。下方清單是目前的計數，不是產生上述百分比的那一組。
 
 測試清單：
 
 | 測試套件 | 測試數 | 是否對 C 版執行 |
 |---|---|---|
-| 單元測試（`cargo test --lib`） | 94 | 否——內部 API |
+| 單元測試（`cargo test --lib`） | 95 | 否——內部 API |
 | `cli_parity` | 18 | 是 |
 | `http_parity` | 21 | 是 |
 | `ws_parity` | 37 | 是 |
@@ -51,7 +53,7 @@
 
 ## 找到的差異
 
-同一套測試分別對兩個 binary 執行後，找出四個真實差異。基於下列原因，四項最後都採用 Rust 版的行為。
+同一套測試分別對兩個 binary 執行後，找出四個真實差異，每一項的處理理由列於下方。第一項是這個移植版自己的缺陷，已修正為與 C 版一致；其餘三項是 C 版的缺陷，在原版維持原狀、在這裡修掉，因此至今仍是兩者有差別的地方。
 
 ### 1. Server 曾在 client 開口前先公布自身資訊
 
@@ -104,7 +106,7 @@ C 版的 `-U daemon:daemon` 能正常運作，socket 最後會是 `srw-rw---- 1 
 
 ## 刻意改善之處
 
-除了上述差異，移植版也刻意做出以下改變：
+除了上述四項差異，移植版也刻意做出以下改變：
 
 - **Basic auth 使用 constant-time 比較**（`subtle::ConstantTimeEq`）。C 版使用 `strcmp`，遇到第一個不同的 byte 就回傳，因而洩漏猜測的 credential 有多少前綴正確。
 - **`Basic` scheme 名稱不分大小寫比對**，符合 RFC 7617。C 版使用 `strstr(buf, "Basic ")`，會拒絕符合規範的 `basic`。
@@ -116,7 +118,7 @@ C 版的 `-U daemon:daemon` 能正常運作，socket 最後會是 `srw-rw---- 1 
 - **明確尊重 `gzip;q=0`。**兩個版本原本都是檢查 `Accept-Encoding` 是否「包含」`gzip`（`http.c` 中的 `strstr`），因此 `gzip;q=0` 也會被判定為接受 gzip；但 RFC 9110 用它表示「不要傳 gzip 給我」。client 因而收到自己才剛聲明無法解碼的壓縮 body，瀏覽器會顯示原始 deflate stream。移植版會將 header 解析為 token 並尊重零權重。兩版以十種 header 形式實測後，差異僅限於 `gzip;q=0`（現在不壓縮）與 `GZIP`（現在壓縮，因 RFC 9110 規定 coding name 不分大小寫）。為了與 C 版一致，`*` 仍刻意**不**視為接受 gzip；任何 client 都能接受未壓縮 body，因此沒有必要在此製造差異。
 - **Log timestamp 使用 UTC**，C 版則印出 local time。這是刻意的：未設定 `TZ` 的 container 本來就是 UTC，而 UTC 也更容易跨 host 對照。
 
-新增兩個選項，既有選項沒有移除：上面提到的 `--title`，以及 `--auth-url` 與其搭配選項；詳見 [README.md](README.md)。
+新增兩個選項，既有選項沒有移除：上面提到的 `--title`，以及 `--auth-url` 與其搭配選項；詳見 [README.zh-TW.md](README.zh-TW.md)。
 
 其中一個選項對應到不同機制。C 版的 `--srv-buf-size` 設定 libwebsockets 的 per-thread service buffer；hyper 沒有對等調整旋鈕，因此移植版把它套用到最接近且可觀察的行為：每次從 PTY 讀取、並放入單一 WebSocket frame 的終端輸出上限。預設值仍為 4096，與 C 版相同；`lifecycle_parity::the_send_buffer_size_bounds_one_output_frame` 會固定這項行為。
 
@@ -154,11 +156,16 @@ C 版的 `-U daemon:daemon` 能正常運作，socket 最後會是 `srw-rw---- 1 
 - **HTTPS redirect 可能產生 client 無法使用的 URL。**沒有可用 authority 的 request——例如不要求 `Host` 的 HTTP/1.0——會產生 `Location: https:///token`。現在 authority 優先取自 `Host`；HTTP/2 與 absolute-form request 則 fallback 到 URI 自身的 authority；兩者都沒有時改回 `400 Bad Request`。（C 版會直接斷線，不回覆任何內容。）
 - **Terminal input 可以無上限排隊。**Child 讀取緩慢或完全不讀時，kernel PTY buffer 會填滿並阻塞 writer thread，client 後續持續送出的所有內容都堆在 server memory。實測：向不讀取的 child 送 15 MiB input，RSS 增加 6.5 MB，沒有任何限制；C 版因 libwebsockets 套用 read flow control，吸收 179 MiB 後成長仍不到 1 MB。現在 session 在 outstanding data 達 4 MiB 後停止讀取 socket，讓 backlog 由 TCP backpressure 限制，而非記憶體。刻意採用 read gating 而不是在讀取內等待，因為 session 以同一個 `select!` 驅動雙向流量；若在其中等待，也會停止排出 child output，讓同時讀寫的 child 自我卡死。這不是假設：第一版修正確實採取阻塞方式，使用 `cat` 的測試也正因此 deadlock。
 - **UNIX domain socket 保留 process umask 決定的權限。**libwebsockets 在 bind 後立刻對它 `chmod 0660`；移植版原本沒有，也略過對 `-u`／`-g` 的 `chown`。這不是任何測試找出的，而是逐行對照 `serve.rs` 與 `server.c`、並對兩個 binary 並列執行 `strace` 時發現。原 socket 測試在 root 下執行，只 assertion `uid == 0`；無論程式有沒有做事都會成立。現在會檢查 mode，並 chown 給不同於測試自身的 user。
+- **一支守護 input backlog 的測試，只在它被寫出來的那台機器上會過。**它繞過 `ws::session` 實際套用的 gate 一路寫下去，並斷言 8 MiB 之內就會撞到上界——那量到的是某台主機的 line discipline 在停止接收前會吞掉多少，而不是這個上界本身。它從 `a827e3d`（PTY 由阻塞 writer thread 改為 readiness 驅動 I/O）開始變紅，之後的十一個 commit、五個星期都紅著沒有被發現，包含這個移植版被合併的那一次。沒有人看的紅燈比缺少測試更糟，因為它照樣被算進測試清單裡。上界本身從未失效：照 gate 的做法模擬，Linux 上 backlog 峰值正好停在 4 MiB；macOS 則根本不會累積，因為該核心是丟棄多餘資料而不是拒絕寫入，實測送出超過 512 MiB 仍沒有任何 outstanding。測試現在改為斷言兩邊都成立的不變量：只要呼叫端在 gate 前停手，排隊量就不會超過上界再加一個 chunk。
 - **Forwarded identity 被默默截斷為 29 bytes**，照搬 C 版的 buffer。影響比表面更嚴重：兩個共享 29-byte prefix 的 account 會被折疊成同一個 `TTYD_USER`。限制現已移除，名稱會完整傳遞。（C 版會直接拒絕這類名稱的 WebSocket upgrade；測試套件現在也會在 C 端 assertion 此行為。）
 
 ## 已知缺口
 
 **Windows 尚未移植。**C 實作透過 ConPTY 支援 Windows（`src/pty.c`、`#ifdef _WIN32`）。Rust 版只原生實作 Unix PTY 路徑，使 `setsid`、controlling terminal acquisition、process-group signalling，以及 `128 + signal` 的 exit convention 能與原版完全一致。Windows backend 可以在相同 `pty` module interface 後方獨立加入；這次選擇暫不提供，而不是交付未經測試的實作。
+
+**Unix 路徑在 Linux 與 macOS 上都經過實測**，兩邊測試套件都全綠：222 支測試分別在一台 arm64 macOS 15.5 主機與 `rust:1.92-slim` container 上通過。達成它需要兩處編譯修正與四處測試修正，都沒有動到行為。`initgroups` 的 base group 參數在 Linux 是 `gid_t`、在 Apple 平台是 `int`，`setgroups` 的數量參數則分別是 `size_t` 與 `int`，因此移植版原本在 macOS 上完全無法編譯。另有四支測試帶著對執行主機而非對程式碼的假設：loopback 裝置在 Linux 叫 `lo`、其他平台叫 `lo0`（兩支）；`--browser` 呼叫的系統開啟程式是 `xdg-open` 或 `open`；殘留 socket 那支只等路徑存在，但它自己剛寫下的殘留檔案本來就存在；`-6` fallthrough 那支把 `lo` 當成沒有 IPv6 位址的介面，然而只要 loopback 帶有 `::1` 這個前提就不成立——它在 Linux 上其實也一直失敗，敗的原因是這個，不是它要守的 fallthrough。
+
+這片綠燈有兩點必須說明，因為 skip 與 pass 看起來一樣。`-6` fallthrough 那支現在會去找一個有 IPv4 而沒有 IPv6 的介面，主機上沒有就跳過；而在每個介面都帶 link-local `fe80::` 的機器上，那是大多數情況。它會把跳過這件事印出來，而不是安靜地通過。另外，這套測試是人工執行的：`.github/` 底下的 workflow 建的是 C 專案，CI 裡沒有任何東西會跑 `cargo test`。BSD 系統未經測試。
 
 C 版 feature matrix 的其他部分皆已實作並覆蓋：全部 30 個 command-line option、四個 HTTP endpoint、八種 WebSocket message type、三種 authentication mode、帶 client-certificate verification 的 TLS、UNIX domain socket、privilege dropping，以及 `--once`／`--exit-no-conn` lifecycle rule。每個 option 至少有一支測試 assertion 可觀察結果，因此這裡的「已實作」指的是確實執行過，而不只是完成 parser。
 
@@ -296,6 +303,6 @@ Review 提出的意見不全是必須修正的缺陷。下列項目與 C 版比�
 
 ## 相依套件
 
-`cargo audit` 對 RustSec database（1169 則 advisory）檢查 `Cargo.lock` 的 224 個 crate，結果為**沒有 vulnerability**。另有一項 informational warning：`rustls-pemfile` 2.2.0 被標記為 unmaintained（RUSTSEC-2025-0134）。它只用來 parse `--ssl-cert`、`--ssl-key` 與 `--ssl-ca` 指定的 PEM file——這些是 operator 提供的 local file，不是 network input。
+`cargo audit` 對 RustSec database（1169 則 advisory）檢查 `Cargo.lock` 的 222 個 crate，結果為**沒有 vulnerability**。另有一項 informational warning：`rustls-pemfile` 2.2.0 被標記為 unmaintained（RUSTSEC-2025-0134）。它只用來 parse `--ssl-cert`、`--ssl-key` 與 `--ssl-ca` 指定的 PEM file——這些是 operator 提供的 local file，不是 network input。
 
 沒有執行 Trivy：此環境的 proxy 將 GitHub access 限制在 session 自己的 repository，因此 installer、release API 與 apt repository 都無法存取。這是本報告的缺口，不是乾淨的檢查結果。
