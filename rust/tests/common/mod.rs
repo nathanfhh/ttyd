@@ -98,10 +98,15 @@ impl Server {
             command.env(key, value);
         }
         if let Some(groups) = groups {
-            // Safety: `setgroups` is async-signal-safe and the vector outlives the call.
+            // Converted here rather than inside the closure: everything between `fork` and
+            // `exec` runs in a child that has only the calling thread, so allocating there can
+            // deadlock on an allocator lock another thread held at the moment of the fork.
+            // `setgroups` itself is async-signal-safe, and this vector is moved in already
+            // built, so the closure allocates nothing.
+            let ids: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
+            // Safety: the closure calls only `setgroups` and reads a vector it owns.
             unsafe {
                 command.pre_exec(move || {
-                    let ids: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
                     // `ngroups` is `size_t` on the Linux family and `int` everywhere else,
                     // the BSDs and Apple platforms included, so the axis is Linux rather
                     // than Apple. Keying this on Apple alone would leave the other BSDs
