@@ -403,7 +403,13 @@ pub fn drop_privileges(cfg: &Config) -> Result<()> {
         Some(user) => {
             let name = std::ffi::CString::new(user.name.as_bytes())
                 .context("user name contains an interior NUL")?;
-            if unsafe { libc::initgroups(name.as_ptr(), target_gid) } != 0 {
+            // `initgroups` takes the base group as `gid_t` almost everywhere, the other
+            // BSDs included, but as `int` on Apple platforms, so only those need adapting.
+            #[cfg(target_vendor = "apple")]
+            let basegroup = target_gid as libc::c_int;
+            #[cfg(not(target_vendor = "apple"))]
+            let basegroup = target_gid;
+            if unsafe { libc::initgroups(name.as_ptr(), basegroup) } != 0 {
                 return Err(std::io::Error::last_os_error()).context("initgroups failed");
             }
         }
@@ -432,6 +438,31 @@ pub fn drop_privileges(cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loopback device is `lo` on Linux and `lo0` on the BSDs, Apple platforms included.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LOOPBACK: &str = "lo";
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LOOPBACK: &str = "lo0";
+
+    /// An interface carrying an IPv4 address and no IPv6 one, or `None` when the host has
+    /// none. Loopback is not a substitute: it carries `::1` on most systems.
+    fn an_interface_with_ipv4_but_no_ipv6() -> Option<String> {
+        use std::collections::HashSet;
+        let (mut v4, mut v6) = (Vec::new(), HashSet::new());
+        for entry in nix::ifaddrs::getifaddrs().ok()? {
+            let Some(storage) = entry.address else {
+                continue;
+            };
+            if storage.as_sockaddr_in().is_some() {
+                v4.push(entry.interface_name.clone());
+            }
+            if storage.as_sockaddr_in6().is_some() {
+                v6.insert(entry.interface_name.clone());
+            }
+        }
+        v4.into_iter().find(|name| !v6.contains(name))
+    }
 
     fn cfg(mutate: impl FnOnce(&mut Config)) -> Config {
         let mut c = Config {
@@ -467,23 +498,38 @@ mod tests {
     fn an_interface_name_resolves_to_its_address() {
         // `-i eth0` in the C help means a device name, not an address.
         let address =
-            resolve_bind_address(&cfg(|c| c.iface = Some("lo".into()))).expect("resolves");
+            resolve_bind_address(&cfg(|c| c.iface = Some(LOOPBACK.into()))).expect("resolves");
         assert_eq!(address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
     fn an_interface_without_ipv6_is_an_error_not_a_silent_v4_fallback() {
         // The bug this guards: the v6 branch used to fall through into the v4 branch, and an
-        // interface's v4 address is normally enumerated first — so `-6 -i lo` bound
-        // 127.0.0.1 and silently ignored `-6`. Answering with an error is the only safe
+        // interface's v4 address is normally enumerated first — so `-6 -i <v4-only>` bound
+        // the v4 address and silently ignored `-6`. Answering with an error is the only safe
         // outcome; quietly binding the wrong family is how a service ends up reachable on an
         // address the operator did not ask for.
+        //
+        // This needs an interface that genuinely has no IPv6 address. An earlier version
+        // named `lo`, which carries `::1` on most systems — it passed only in a container
+        // whose loopback happened to lack IPv6, and failed everywhere else for that reason
+        // rather than for the fallthrough it is meant to catch.
+        let Some(iface) = an_interface_with_ipv4_but_no_ipv6() else {
+            // Most hosts give every interface a link-local `fe80::`, so this skips more often
+            // than it runs. Saying so is the point: a silent skip and a pass are the same
+            // green, and this suite discloses its other skips rather than banking them.
+            eprintln!(
+                "skipped: no interface on this host has IPv4 without IPv6, so the `-6` \
+                 fallthrough guard cannot be exercised here"
+            );
+            return;
+        };
         let result = resolve_bind_address(&cfg(|c| {
             c.ipv6 = true;
-            c.iface = Some("lo".into());
+            c.iface = Some(iface.clone());
         }));
         match result {
-            Ok(address) => panic!("-6 -i lo resolved to {address}, ignoring -6"),
+            Ok(address) => panic!("-6 -i {iface} resolved to {address}, ignoring -6"),
             Err(e) => assert!(
                 e.to_string().contains("no IPv6 address"),
                 "unhelpful error: {e}"

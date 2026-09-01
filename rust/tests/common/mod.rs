@@ -16,6 +16,18 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 pub const TTY_SUBPROTOCOL: &str = "tty";
+
+/// The loopback device, named `lo` on Linux and `lo0` on the BSDs, Apple platforms included.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const LOOPBACK: &str = "lo";
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const LOOPBACK: &str = "lo0";
+
+/// The program `--browser` hands the URL to, which `utils::open_uri` selects per platform.
+#[cfg(target_os = "macos")]
+pub const SYSTEM_OPENER: &str = "open";
+#[cfg(not(target_os = "macos"))]
+pub const SYSTEM_OPENER: &str = "xdg-open";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Path of the binary under test.
@@ -90,7 +102,15 @@ impl Server {
             unsafe {
                 command.pre_exec(move || {
                     let ids: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
-                    if libc::setgroups(ids.len(), ids.as_ptr()) != 0 {
+                    // `ngroups` is `size_t` on the Linux family and `int` everywhere else,
+                    // the BSDs and Apple platforms included, so the axis is Linux rather
+                    // than Apple. Keying this on Apple alone would leave the other BSDs
+                    // failing to compile exactly as before.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let ngroups = ids.len();
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let ngroups = ids.len() as libc::c_int;
+                    if libc::setgroups(ngroups, ids.as_ptr()) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
