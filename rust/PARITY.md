@@ -370,11 +370,18 @@ approach above was blind.
   not the bound itself. It went red at `a827e3d`, where the PTY moved from a blocking writer
   thread to readiness-driven I/O, and stayed red across the eleven commits that followed,
   five weeks, this port's merge included, without being noticed. A red test nobody reads is worse than a missing one: it still appears
-  in the inventory. The bound itself was never broken — modelling the gate shows the backlog
-  peaking at exactly 4 MiB on Linux, and on macOS the queue never builds at all, because that
-  kernel discards the excess rather than refusing the write, measured at over 512 MiB sent
-  with nothing outstanding. The test now asserts the invariant that holds on both: a caller
-  that stops at the gate never queues more than one chunk past the ceiling.
+  in the inventory. The bound itself was never broken: modelling the gate shows the backlog
+  peaking at exactly 4 MiB on Linux. The first rewrite replaced the 8 MiB premise with
+  `peak <= MAX_QUEUED_INPUT + chunk`, and that rewrite was itself vacuous on macOS, which
+  review caught: with `input_backlog_is_full()` hard-wired to `false`, so the bound was gone
+  entirely, it still passed there, because a canonical-mode line discipline discards the
+  excess rather than refusing the write and nothing ever queues. That is the same defect the
+  rewrite was fixing. The child now puts its terminal into raw mode before it stops reading,
+  so both kernels apply backpressure and the gate engages on both. The negative control fails
+  on both as well: with the bound removed, the test reports writing 64 MiB without the backlog
+  ever filling. It asserts two things now rather than one weaker invariant: that the gate is
+  actually reached, and that a caller which stops there never queues more than one chunk past
+  the ceiling.
 - **The forwarded identity was silently truncated to 29 bytes**, mirroring the C buffer. That
   is worse than it looks: two accounts sharing a 29-byte prefix would collapse onto the same
   `TTYD_USER`. The limit is gone — the name is passed through whole. (The C build refuses the
