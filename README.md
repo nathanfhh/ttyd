@@ -11,6 +11,19 @@
 
 ttyd is a simple command-line tool for sharing terminal over the web.
 
+## What this fork adds
+
+This fork keeps the upstream C implementation and adds a compatible Rust port of the server
+in [`rust/`](rust). It preserves the command-line, HTTP and `tty` WebSocket surfaces while
+adding forward authentication (`--auth-url`) and a server-side title override (`--title`) that
+can keep the full command line from being sent to clients.
+
+The compatibility claim is backed by a shared differential suite with 108 checks that runs
+against both builds; during the rewrite, it uncovered four real behavioural differences. See the
+[parity report](rust/PARITY.md) or its [Traditional Chinese translation](rust/PARITY.zh-TW.md).
+The Rust port does not yet support Windows; use the C build there. This work grew out of the
+30-day series [AI 的駕馭之道](https://ithelp.ithome.com.tw/users/20183518/ironman/9187).
+
 ![screenshot](https://github.com/tsl0922/ttyd/raw/main/screenshot.gif)
 
 # Features

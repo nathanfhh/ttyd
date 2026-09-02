@@ -11,6 +11,17 @@
 
 ttyd 是一個把終端分享到網頁上的簡單命令列工具。
 
+## 這個 fork 增加了什麼
+
+這個 fork 保留上游 C 實作，並在 [`rust/`](rust) 提供相容的 Rust 伺服器移植版。它維持
+相同的命令列、HTTP 與 `tty` WebSocket 介面，同時加入 forward authentication
+（`--auth-url`），以及可避免將完整命令列傳給 client 的伺服器端標題覆寫（`--title`）。
+
+相容性不是口頭宣稱：一套包含 108 項檢查的差異測試會對兩個版本執行，並在重寫過程中
+找出四個真實的行為差異。詳情請見 [相容性報告](rust/PARITY.zh-TW.md)與
+[英文原文](rust/PARITY.md)。Rust 版尚未支援 Windows；該平台請使用 C 版。這份實作源自
+三十天連載 [《AI 的駕馭之道》](https://ithelp.ithome.com.tw/users/20183518/ironman/9187)。
+
 ![screenshot](https://github.com/tsl0922/ttyd/raw/main/screenshot.gif)
 
 # 功能
