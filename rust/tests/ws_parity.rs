@@ -395,16 +395,17 @@ async fn pause_stops_output_and_resume_restarts_it() {
 
 #[tokio::test]
 async fn a_clean_exit_closes_with_code_1000() {
-    // Deliberate divergence from the C implementation. `callback_tty` does call
-    // `lws_close_reason(wsi, 1000)`, but it returns 1 from the writable callback in the same
-    // breath, which makes libwebsockets drop the connection instead of completing the close
-    // handshake — the code never reaches the wire. The frontend keys its "should I
-    // reconnect?" decision on `event.code !== 1000`, so in the C build a shell that exits
-    // cleanly still triggers a reconnect. This port completes the handshake instead.
-    if common::is_c_reference() {
-        return;
-    }
-
+    // Shared behaviour, not a divergence, though this test asserted the opposite for most of
+    // its life. It used to skip the C build, on the belief that `callback_tty` calling
+    // `lws_close_reason(wsi, 1000)` and then returning 1 from the writable callback made
+    // libwebsockets drop the connection before the code reached the wire. That reading was
+    // wrong: returning non-zero is how a callback asks lws to close, and lws sends the reason
+    // set beforehand. The guard was here from the commit that introduced this test, so
+    // nothing ever contradicted the claim. Measured on the wire, both builds close a clean
+    // exit with 1000, on the pinned 1.7.7-40e79c7 release binary (libwebsockets 4.3.3) and on
+    // a homebrew 1.7.7 (libwebsockets 4.5.8). The guard is gone so that the assertion covers
+    // C as well; an older lws may behave differently, and this going red against one of them
+    // is the suite doing its job rather than a reason to skip it again. See PARITY.md §2.
     let server = Server::start(&["-W", "sh", "-c", "exit 0"]);
     let mut ws = connect_ws(&server.ws_url("/ws"), &[])
         .await
@@ -421,8 +422,13 @@ async fn a_clean_exit_closes_with_code_1000() {
 
 #[tokio::test]
 async fn a_failing_exit_does_not_close_with_1000() {
-    // The frontend reconnects for any code other than 1000, which is how a crashed shell is
-    // meant to behave.
+    // A crashed shell must not look clean, so neither build may close with 1000. Both satisfy
+    // that, but what the browser then does is not the same, and the difference is what
+    // PARITY.md §2 is about: C puts the reserved code 1006 into a close
+    // frame, which RFC 6455 §7.4.1 forbids, so a strict client reports a protocol violation;
+    // this port sends no close frame at all, which is what an abnormal closure is defined to
+    // look like. Asserting only `!= 1000` cannot tell those apart, and for a while nothing
+    // else did either.
     let server = Server::start(&["-W", "sh", "-c", "exit 3"]);
     let mut ws = connect_ws(&server.ws_url("/ws"), &[])
         .await
@@ -432,6 +438,24 @@ async fn a_failing_exit_does_not_close_with_1000() {
     let (_, ending) = drain_until_close(&mut ws, LONG).await;
     assert_ne!(ending, Ending::Close(1000), "a failure must not look clean");
     assert_ne!(ending, Ending::Timeout, "the session should have ended");
+    if common::is_c_reference() {
+        // tungstenite maps the invalid 1006 frame to 1002 (protocol error). A browser fires
+        // `error` before `close` for the same reason, and the bundled frontend disables
+        // reconnection when it does, which is why the two builds behave differently in a
+        // browser even though both are "not 1000".
+        assert_eq!(
+            ending,
+            Ending::Close(1002),
+            "C is expected to put the reserved 1006 into a close frame, which tungstenite \
+             reports as 1002; a change here means either C's behaviour or that mapping moved"
+        );
+    } else {
+        assert_eq!(
+            ending,
+            Ending::Abnormal,
+            "this port drops the socket without a close frame"
+        );
+    }
 }
 
 #[tokio::test]

@@ -67,9 +67,14 @@ Test inventory:
 | `lifecycle_parity` | 28 | yes |
 | `forward_auth` | 19 | no — new feature |
 
-99 of the 108 shared tests assert identical behaviour on both binaries. The remaining nine
+95 of the 108 shared tests assert identical behaviour on both binaries. The remaining thirteen
 are the documented divergences below plus the tests covering behaviour the C build does not
-have (`--title`, base-path normalization, and identities longer than its 29-byte buffer).
+have: forward authentication's startup validation (two tests) and its `--help` entry,
+`--title`, client-certificate
+verification, an explicit gzip refusal, the `-f` send-buffer ceiling, credential redaction in
+the log, and base-path normalization. Eleven of the thirteen return early against C; two run
+on both with a per-build assertion (identities longer than its 29-byte buffer, and the close
+code a failing exit produces).
 
 What the remaining ~12 % of uncovered C lines consists of, checked line by line:
 allocation and `lws_write` failure branches, `inflate` failure handling, `fork`/`execvp`
@@ -83,7 +88,14 @@ to `nobody`, so that run contributes nothing to the coverage number.
 
 ## Divergences found
 
-Running the suite against both binaries surfaced four real differences, each resolved for
+Four real differences are documented below. The suite surfaced three of them by running
+against both binaries. §2 it missed, and the two faults behind that are worth naming
+separately. `a_clean_exit_closes_with_code_1000`, named for the claim §2 used to make,
+skipped the C build from the commit that introduced it, so that claim was never once checked
+against C. `a_failing_exit_does_not_close_with_1000`, which covers the path where the two
+builds really do differ, ran against both but asserted only `!= 1000`, which every ending a
+failing exit produces satisfies. The two hid different things, and the weak assertion alone was enough to keep the
+real difference out of the record until it was found by hand. Each difference is resolved for
 the reasons given below. The first was this port's own defect and was corrected to match C;
 the other three are C defects left as they are there and fixed here, so they remain places
 where the two builds differ.
@@ -108,21 +120,54 @@ carrying a script path, a host or a key never reaches the browser. It is distinc
 existing `-t titleFixed=…` client option, which only changes what the browser displays
 after the real title has already been sent over the wire.
 
-### 2. A clean exit never reaches the browser as close code 1000
+### 2. A failing exit puts a reserved close code on the wire
 
-**Found by:** `ws_parity::a_clean_exit_closes_with_code_1000`.
+**Found by:** hand, on the wire, 2026-09-02. Two separate failures kept the suite from
+finding it. `ws_parity::a_clean_exit_closes_with_code_1000` carried
+`if is_c_reference() { return; }` from the commit that introduced it, so the claim this
+section used to make had never once run against C. And the test that does cover the failing
+path, `a_failing_exit_does_not_close_with_1000`, always ran against both builds but asserted
+only `!= 1000`, which every ending below satisfies. A skipped test and a weak assertion are
+different faults and they hid different things: the skip kept the old claim from ever being
+checked, the weak assertion kept the real difference from being recorded. The second would
+have been enough on its own.
 
-The frontend decides whether to reconnect with `if (event.code !== 1000)`. The C code
-means to cooperate — it calls `lws_close_reason(wsi, 1000)` — but it returns `1` from the
-writable callback in the same breath, which makes libwebsockets drop the connection
-instead of completing the close handshake. Observed on the wire, a C session always ends
-in `ResetWithoutClosingHandshake`, so the browser sees 1006 and offers to reconnect even
-after the user typed `exit`.
+**This section previously recorded the opposite of what it now records**, and the correction
+is worth more than the defect. It claimed that a clean exit never reaches the browser as
+1000, reasoning that `callback_tty` calls `lws_close_reason(wsi, 1000)` and then returns `1`
+from the writable callback, which was read as dropping the connection before the handshake
+could complete. That reading is wrong: returning non-zero from a callback is the documented
+way to ask libwebsockets to close, and it sends the reason set beforehand. The two lines are
+a pair, not a contradiction. Measured on the wire against the pinned `1.7.7-40e79c7` release
+binary (libwebsockets 4.3.3) and against a homebrew 1.7.7 (libwebsockets 4.5.8), a clean exit
+closes with **1000** followed by a FIN on both. With the guard removed, the test agrees.
 
-**Resolution: the port completes the close handshake**, sending 1000 for a clean exit and
-dropping the connection without a close frame otherwise — which is what a browser reports
-as 1006. The test is skipped when running against the C reference, with the reason
-recorded at the assertion.
+What actually differs is the failing path:
+
+| child ends by | C 1.7.7 | this port |
+|---|---|---|
+| `exit 0` | close frame, code 1000 | close frame, code 1000 |
+| non-zero exit, or a signal | close frame, code **1006** | **no close frame**, socket dropped |
+
+C takes `process->exit_code == 0 ? 1000 : 1006` straight into the frame. RFC 6455 §7.4.1
+reserves 1006 for an endpoint to report an abnormal closure locally and states it MUST NOT be
+set as a status code in a Close control frame. A strict client treats the frame as a protocol
+violation: tungstenite turns it into `Close(1002)`, and a browser fires `error` before `close`.
+
+**Resolution: the port sends 1000 for a clean exit and no close frame otherwise**, which is
+what an abnormal closure is defined to look like.
+
+The consequence is not symmetric, and this repository's own frontend is where it shows.
+`html/src/components/terminal/xterm/index.ts` disables reconnection when the socket fires
+`error`, and of these two teardowns only the invalid frame does. Against C the violation
+therefore acts as a brake; against this port the browser sees a silent drop, keeps `doReconnect` true, and
+reconnects immediately, with no delay and no bound. Nobody designed that brake, and
+correcting the protocol removed it.
+
+For most of this section's life nothing in the suite held it:
+`a_failing_exit_does_not_close_with_1000` asserted only `!= 1000`, which both `Close(1002)`
+and an abnormal drop satisfy. It now asserts the ending each build produces, so what this
+section records is checked on every run instead of resting on the measurement above.
 
 ### 3. `PAUSE` does nothing
 
@@ -172,10 +217,11 @@ changes them:
 
 - **Output from a very short-lived process can be lost.** With `ttyd -a -W echo`, the C
   build delivered the output on roughly three runs out of five; the abrupt teardown races
-  with the last frame, and a TCP reset discards whatever the client had buffered. The Rust
-  port was stable across the same runs because it closes gracefully. Two tests were
-  rewritten to keep the child alive briefly so they measure argument passing rather than
-  shutdown timing.
+  with the last frame. The mechanism recorded here used to be "a TCP reset discards whatever
+  the client had buffered", which came from the same misreading as §2 and is wrong: measured
+  on the wire, C ends with a close frame followed by a FIN, not a reset. What the last frame
+  actually races against has not been established. Two tests were rewritten to keep the child
+  alive briefly so they measure argument passing rather than shutdown timing.
 
 ## Deliberate improvements
 

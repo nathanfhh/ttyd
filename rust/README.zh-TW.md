@@ -122,7 +122,7 @@ SBOM 採即時產生而非簽入版本庫。它完全衍生自 `Cargo.lock`，�
 
 ## 相容性
 
-C 實作的每一個命令列選項、HTTP endpoint、WebSocket 訊息型別與認證模式都有支援。有三項行為刻意不同——正常結束現在會以 WebSocket close code 1000 抵達瀏覽器、`PAUSE` 真的會暫停，以及 basic-auth 比較採用 constant time——每一項都在 [PARITY.zh-TW.md](PARITY.zh-TW.md) 中說明。`--title`、`--auth-url` 及其搭配選項是新增的；既有的功能沒有移除任何一項。
+C 實作的每一個命令列選項、HTTP endpoint、WebSocket 訊息型別與認證模式都有支援。有三項行為刻意不同：非正常結束時不會把保留碼 1006 送上 wire、`PAUSE` 真的會暫停，以及 basic-auth 比較採用 constant time，每一項都在 [PARITY.zh-TW.md](PARITY.zh-TW.md) 中說明。`--title`、`--auth-url` 及其搭配選項是新增的；既有的功能沒有移除任何一項。
 
 **Windows 尚未移植。**C 版透過 ConPTY 支援它；這個移植版只實作 Unix PTY 路徑。Windows backend 可以放在相同的 `pty` module interface 後方，這次選擇不提供，而不是交付未經測試的實作。
 

@@ -45,7 +45,7 @@
 | `lifecycle_parity` | 28 | 是 |
 | `forward_auth` | 19 | 否——新增功能 |
 
-108 支共用測試中，有 99 支在兩個 binary 上主張完全相同的行為。其餘九支包含下方記錄的差異，以及 C 版沒有的行為測試（`--title`、base path 正規化，以及長度超過其 29-byte 緩衝區的身分名稱）。
+108 支共用測試中，有 95 支在兩個 binary 上主張完全相同的行為。其餘十三支包含下方記錄的差異，以及 C 版沒有的行為測試：forward authentication 的啟動檢查（兩支）與它的 `--help` 條目、`--title`、client certificate 驗證、明確拒絕 gzip、`-f` 送出緩衝上限、憑證不得進入 log，以及 base path 正規化。十三支裡有十一支對 C 版直接跳過；另外兩支兩邊都跑，但每個 build 各有自己的斷言（長度超過 29-byte 緩衝區的身分名稱，以及失敗離開時產生的 close code）。
 
 逐行檢查後，C 版剩餘約 12% 未覆蓋程式碼包括：記憶體配置與 `lws_write` 失敗分支、`inflate` 失敗處理、`fork`／`execvp` 失敗路徑、`SIGABRT` handler、必須使用刻意放慢的 client 才能觸發的 HTTP 部分寫入路徑，以及因下述 C 版缺陷而不可達的程式碼。若不做 fault injection，這些都不是黑箱測試能驅動的行為。
 
@@ -53,7 +53,7 @@
 
 ## 找到的差異
 
-同一套測試分別對兩個 binary 執行後，找出四個真實差異，每一項的處理理由列於下方。第一項是這個移植版自己的缺陷，已修正為與 C 版一致；其餘三項是 C 版的缺陷，在原版維持原狀、在這裡修掉，因此至今仍是兩者有差別的地方。
+下方記錄四個真實差異。其中三個是同一套測試分別對兩個 binary 執行後找出來的。§2 它漏掉了，而背後那兩個失誤值得分開點名。`a_clean_exit_closes_with_code_1000` 這個名字取自 §2 原本的宣稱，它從被加進來的那一顆 commit 起就對 C 版整支跳過，所以那個宣稱一次都沒有對 C 版檢查過。`a_failing_exit_does_not_close_with_1000` 涵蓋的才是兩個 build 真正有差別的那條路，它一直對兩邊都跑，但只斷言 `!= 1000`，而失敗離開能產生的每一種結束方式都滿足這個條件。兩者藏住的是不同的東西，而且光是那個太弱的斷言，就足以讓真正的差異一直不被記錄，直到有人用手量出來。每一項的處理理由列於下方。第一項是這個移植版自己的缺陷，已修正為與 C 版一致；其餘三項是 C 版的缺陷，在原版維持原狀、在這裡修掉，因此至今仍是兩者有差別的地方。
 
 ### 1. Server 曾在 client 開口前先公布自身資訊
 
@@ -65,13 +65,26 @@
 
 與 C 版對齊後封住了驗證前的漏洞，但沒有消除根本暴露面：即使在 C 版中，任何合法開啟 session 的 client 仍會收到完整命令列。因此移植版新增 `--title`，直接取代 server 公布的 title，讓可能帶有 script 路徑、host 或 key 的命令不會抵達瀏覽器。這與既有的 `-t titleFixed=…` client 選項不同；後者只是等真正的 title 已經傳過網路之後，才改變瀏覽器畫面顯示的內容。
 
-### 2. 正常離開時，瀏覽器收不到 close code 1000
+### 2. 非正常結束時，保留碼被送上 wire
 
-**發現方式：**`ws_parity::a_clean_exit_closes_with_code_1000`。
+**發現方式：**人工在 wire 上量測，2026-09-02。有兩個各自獨立的失誤讓測試套件抓不到它。`ws_parity::a_clean_exit_closes_with_code_1000` 自從被加進來的那一顆 commit 起就帶著 `if is_c_reference() { return; }`，所以本節原本的宣稱從來沒有對 C 版執行過一次。而真正涵蓋失敗路徑的 `a_failing_exit_does_not_close_with_1000` 一直都對兩個 build 執行，但它只斷言 `!= 1000`，下面表格裡的每一種結束方式都滿足這個條件。被跳過的測試與太弱的斷言是兩種不同的毛病，藏住的東西也不一樣：跳過讓舊的宣稱從來沒有被檢查，太弱的斷言讓真正的差異沒有被記錄下來。後者光靠自己就夠了。
 
-前端使用 `if (event.code !== 1000)` 判斷是否重新連線。C 程式碼原本有意配合：它呼叫 `lws_close_reason(wsi, 1000)`；但又在同一次 writable callback 中立刻回傳 `1`，使 libwebsockets 直接中斷連線，而沒有完成 close handshake。從 wire 上觀察，C 版 session 總是以 `ResetWithoutClosingHandshake` 結束，所以即使使用者輸入了 `exit`，瀏覽器仍會看到 1006 並提供重新連線。
+**本節原本記錄的內容與現在完全相反**，而這次更正比缺陷本身更值得留下。原本寫的是「正常離開時瀏覽器收不到 1000」，理由是 `callback_tty` 呼叫 `lws_close_reason(wsi, 1000)` 之後隨即從 writable callback 回傳 `1`，當時把它讀成「連線在 close handshake 完成前就被丟掉」。那個解讀是錯的：從 callback 回傳非零**就是** libwebsockets 文件裡請求關閉連線的做法，而它關閉時會把先前設好的 reason 送出去。這兩行是配套，不是互相抵銷。對釘死的 `1.7.7-40e79c7` release binary（libwebsockets 4.3.3）與 homebrew 的 1.7.7（libwebsockets 4.5.8）分別在 wire 上量測，正常離開都是送出 **1000** 之後接 FIN。把 guard 拿掉之後，測試套件也同意這件事。
 
-**處理方式：移植版會完成 close handshake。**正常離開送出 1000；其他情況則不送 close frame、直接中斷，瀏覽器會將其回報為 1006。對 C 參考版執行時會跳過此測試，理由記錄在 assertion 上。
+真正有差別的是失敗那條路：
+
+| child 的結束方式 | C 1.7.7 | 本移植版 |
+|---|---|---|
+| `exit 0` | close frame，code 1000 | close frame，code 1000 |
+| 非零離開或被訊號終止 | close frame，code **1006** | **不送 close frame**，直接中斷 |
+
+C 版把 `process->exit_code == 0 ? 1000 : 1006` 直接寫進 frame。RFC 6455 §7.4.1 把 1006 保留給端點在本地表示異常關閉，並明文規定它 MUST NOT 出現在 Close control frame 的 status code 裡。嚴格的 client 會把這個 frame 當成協定違規：tungstenite 會轉成 `Close(1002)`，瀏覽器則會在 `close` 之前先 fire `error`。
+
+**處理方式：移植版正常離開送 1000，其餘情況不送 close frame**，那才是異常關閉在規範裡該有的樣子。
+
+後果並不對稱，而且就顯現在這個 repo 自己的前端上。`html/src/components/terminal/xterm/index.ts` 在 socket fire `error` 時會關掉重新連線，而這兩種收線方式裡只有違規的那個 frame 會觸發它。對 C 版來說，這個違規因此變成一個煞車；對本移植版來說，瀏覽器看到的是安靜的中斷，`doReconnect` 維持為 true，於是立刻重連，沒有延遲也沒有次數上限。那個煞車沒有任何人設計過，而把協定改對的同時也拆掉了它。
+
+本節在它大部分的生命裡沒有任何測試守著：`a_failing_exit_does_not_close_with_1000` 當時只斷言 `!= 1000`，而 `Close(1002)` 與異常中斷兩者都滿足它。它現在會分別斷言兩個 build 各自產生的結束方式，所以本節記錄的內容每一次執行都會被檢查，不再只靠上面那次人工量測。
 
 ### 3. `PAUSE` 沒有作用
 
@@ -102,7 +115,7 @@ C 版的 `-U daemon:daemon` 能正常運作，socket 最後會是 `srw-rw---- 1 
 
 這些結果來自差異測試，但移植版本身沒有改變它們，因此另列於此：
 
-- **生命週期極短的 process 可能遺失輸出。**使用 `ttyd -a -W echo` 時，C 版大約五次只有三次能送達輸出；突然 teardown 會與最後一個 frame 競速，而 TCP reset 會丟棄 client 尚在 buffer 裡的資料。Rust 版因為會正常關閉，在同樣的執行中表現穩定。兩支測試後來改成讓 child 短暫存活，確保測的是參數傳遞，而不是 shutdown timing。
+- **生命週期極短的 process 可能遺失輸出。**使用 `ttyd -a -W echo` 時，C 版大約五次只有三次能送達輸出；突然 teardown 會與最後一個 frame 競速。本節原本記錄的機制是「TCP reset 會丟棄 client 尚在 buffer 裡的資料」，那個說法與 §2 出自同一個誤讀，是錯的：在 wire 上量測，C 版是送出 close frame 之後接 FIN，不是 reset。最後一個 frame 究竟在跟什麼競速，目前沒有定論。兩支測試後來改成讓 child 短暫存活，確保測的是參數傳遞，而不是 shutdown timing。
 
 ## 刻意改善之處
 

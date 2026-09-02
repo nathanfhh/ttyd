@@ -288,8 +288,14 @@ async fn session(
         }
     }
 
-    // A clean exit tells the frontend not to reconnect; anything else must not, so the
-    // socket is dropped without a close frame and the browser reports code 1006.
+    // A clean exit closes with 1000, which is the frontend's signal not to reconnect.
+    // Anything else is an abnormal closure, and RFC 6455 §7.4.1 leaves one way to express
+    // that: drop the connection without a close frame, which a browser reports as 1006.
+    // Note what this does not buy. The C build puts the reserved 1006 into a close frame
+    // instead, which browsers treat as a protocol violation and surface as an `error` event,
+    // and the bundled frontend disables reconnection when it sees one. So being correct here
+    // is also what leaves the frontend reconnecting with no delay and no bound. See
+    // PARITY.md §2.
     let clean = exit_info.map(|i| i.success()).unwrap_or(false);
     if clean {
         let _ = sink
